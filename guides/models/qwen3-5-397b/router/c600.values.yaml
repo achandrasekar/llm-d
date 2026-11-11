@@ -1,0 +1,119 @@
+## Qwen3.5-397B (Google TPU v7x, 4P3D DP4xTP2 multi-port decode — c600 max throughput)
+## guide overrides for the llm-d router.
+## Layer on top of: recipes/router/base.values.yaml
+
+router:
+  extraServicePorts:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: 8081
+
+  epp:
+    # Single EPP replica: approx-prefix-cache-producer, inflight-load-producer,
+    # and session-affinity-filter maintain process-local state.
+    replicas: 1
+    flags:
+      # disaggregatedset-rollout-screener, utilization-filter, and session-affinity-filter
+      # include Alpha/Experimental stability plugins.
+      allow-experimental-plugins: true
+    pluginsConfigFile: "pd-c600-config.yaml"
+    pluginsCustomConfig:
+      pd-c600-config.yaml: |
+        apiVersion: llm-d.ai/v1
+        kind: EndpointPickerConfig
+        plugins:
+        - type: disaggregatedset-rollout-screener
+          parameters:
+            scope:
+              labelSelector: "disaggregatedset.x-k8s.io/name=pd-disagg-tpu-qwen35"
+            revisionGating:
+              mode: max-role
+              requiredRoles: [prefill, decode]
+        - type: always-disagg-pd-decider
+        - type: disagg-profile-handler
+          parameters:
+            deciders:
+              prefill: always-disagg-pd-decider
+        - type: prefill-filter
+        - type: decode-filter
+        - type: approx-prefix-cache-producer
+          parameters:
+            autoTune: false
+            blockSizeTokens: 64
+            lruCapacityPerServer: 2000000
+            maxPrefixTokensToMatch: 262144
+        - type: inflight-load-producer
+        - type: prefix-cache-affinity-filter
+          parameters:
+            maxTTFTPenaltyMs: 60000
+            peakPrefillThroughput: 27000
+        - name: utilization-detector
+          type: utilization-detector
+          parameters:
+            kvCacheUtilThreshold: 0.98
+            queueDepthThreshold: 48
+        - name: decode-headroom
+          type: utilization-filter
+          parameters:
+            conditions:
+              - metric: kv-cache-utilization
+                maxValue: 0.8
+              - metric: running-requests
+                maxValue: 26
+            fallbackOnEmpty: true
+        # Pins multi-turn sessions onto the same decode DP rank when the client passes
+        # `x-dynamo-session-id` (sent by `aiperf` AgentX trace replay); falls back to
+        # load + prefix-cache scoring when the header is absent.
+        - name: session-affinity-decode
+          type: session-affinity-filter
+          parameters:
+            strategy: session_id
+            sessionIdConfig:
+              evictionSweepSeconds: 30
+              evictionTtlSeconds: 14400
+              sources:
+                - header: x-dynamo-session-id
+        - type: token-load-scorer
+          parameters:
+            queueThresholdTokens: 67108864
+        - type: prefix-cache-scorer
+        - type: active-request-scorer
+        - type: running-requests-size-scorer
+        - type: kv-cache-utilization-scorer
+        - type: max-score-picker
+        schedulingProfiles:
+        - name: prefill
+          plugins:
+          - pluginRef: prefill-filter
+          - pluginRef: prefix-cache-affinity-filter
+          - pluginRef: prefix-cache-scorer
+            weight: 2
+          - pluginRef: token-load-scorer
+            weight: 1
+          - pluginRef: max-score-picker
+        - name: decode
+          plugins:
+          - pluginRef: decode-filter
+          - pluginRef: decode-headroom
+          - pluginRef: session-affinity-decode
+          - pluginRef: prefix-cache-scorer
+            weight: 2
+          - pluginRef: active-request-scorer
+            weight: 3
+          - pluginRef: running-requests-size-scorer
+            weight: 2
+          - pluginRef: kv-cache-utilization-scorer
+            weight: 1
+          - pluginRef: max-score-picker
+
+  modelServers:
+    # Decode runs DP=4 x TP=2 with --data-parallel-multi-port-external-lb behind the
+    # routing sidecar on :8000..:8003; prefill sets annotation llm-d.ai/active-ports="8000".
+    targetPorts:
+      - number: 8000
+      - number: 8001
+      - number: 8002
+      - number: 8003
+    matchLabels:
+      llm-d.ai/guide: "qwen3-5-397b"

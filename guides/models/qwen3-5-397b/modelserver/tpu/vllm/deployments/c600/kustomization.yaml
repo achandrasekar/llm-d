@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Maximum-throughput operating point (`c600`): 4 prefill + 3 decode single-host tpu7x slices (28 chips),
+# multi-port attention DP=4 x TP=2 decode (`--max-num-seqs=28` per DP rank, 112 per decode host).
+resources:
+  - ../../base
+
+components:
+  - ../../components/dp4tp2

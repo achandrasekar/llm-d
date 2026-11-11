@@ -1,8 +1,9 @@
 # TPU7x host-DRAM tier (VARIANT=cpu): HBM -> host DRAM through Torch TPU's
-# TPURaidenOffloadingConnector (tpu-sync). The engine is the Qwen3.5-397B model guide's
-# unified layout (guides/models/qwen3-5-397b) without MTP: 8 data-parallel engines
-# (DP=8, TP=1) with expert parallelism on one 2x2x1 slice, fp8 KV cache, 262k context,
-# --gpu-memory-utilization=0.90 so HBM holds as much KV as it safely can.
+# TPURaidenOffloadingConnector (tpu-sync). The engine uses the single-host aggregated
+# layout without MTP: 8 data-parallel engines (DP=8, TP=1) with expert parallelism on one
+# 2x2x1 slice, fp8 KV cache, 262k context, --gpu-memory-utilization=0.90 so HBM holds as
+# much KV as it safely can (for the xPyD disaggregated Qwen3.5-397B recipe, see
+# guides/models/qwen3-5-397b).
 #
 # Tier sizing fills the lower-latency tiers first: HBM at 0.90, then host DRAM.
 # cpu_bytes_to_use is per DP engine: 32 GiB x 8 engines = 256 GiB pinned host tier per

@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Balanced operating point (`c224`): 2 prefill + 4 decode single-host tpu7x slices (24 chips),
+# TP8 + DCP4 megakernel decode (EP mode), `--max-num-seqs=8` per decode host.
+resources:
+  - ../../base
+
+components:
+  - ../../../../../../../recipes/modelserver/components/disaggregatedset-schema
+
+patches:
+  - path: patch.yaml

@@ -1,0 +1,103 @@
+## Qwen3.5-397B (Google TPU v7x, 3P5D TP8+DCP4 megakernel decode — c368 default)
+## guide overrides for the llm-d router.
+## Layer on top of: recipes/router/base.values.yaml
+
+router:
+  extraServicePorts:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: 8081
+
+  epp:
+    # Single EPP replica: approx-prefix-cache-producer and inflight-load-producer
+    # maintain process-local state, so multiple active-active replicas would split
+    # the prefix index and under-count in-flight prefill load.
+    replicas: 1
+    flags:
+      # disaggregatedset-rollout-screener is Alpha stability.
+      allow-experimental-plugins: true
+    pluginsConfigFile: "pd-c368-config.yaml"
+    pluginsCustomConfig:
+      pd-c368-config.yaml: |
+        apiVersion: llm-d.ai/v1
+        kind: EndpointPickerConfig
+        plugins:
+        # Pin each request to a single DisaggregatedSet revision during rollouts
+        # so prefill and decode pods never pair across incompatible revisions.
+        - type: disaggregatedset-rollout-screener
+          parameters:
+            scope:
+              labelSelector: "disaggregatedset.x-k8s.io/name=pd-disagg-tpu-qwen35"
+            revisionGating:
+              mode: max-role
+              requiredRoles: [prefill, decode]
+        - type: always-disagg-pd-decider
+        - type: disagg-profile-handler
+          parameters:
+            deciders:
+              prefill: always-disagg-pd-decider
+        - type: prefill-filter
+        - type: decode-filter
+        - type: approx-prefix-cache-producer
+          parameters:
+            # autoTune sizes the LRU from on-device HBM blocks only and ignores the
+            # 550 GB prefill host-DRAM tier (llm-d/llm-d-router#1650).
+            autoTune: false
+            blockSizeTokens: 64
+            lruCapacityPerServer: 2000000
+            maxPrefixTokensToMatch: 262144
+        - type: inflight-load-producer
+        - type: prefix-cache-affinity-filter
+          parameters:
+            maxTTFTPenaltyMs: 8000
+            # Calibrated on the TPU v7x PP=8 prefill engine for Qwen3.5-397B-A17B-FP8.
+            peakPrefillThroughput: 62000
+        - name: utilization-detector
+          type: utilization-detector
+          parameters:
+            kvCacheUtilThreshold: 0.98
+            queueDepthThreshold: 48
+        - name: decode-spill
+          type: utilization-detector
+          parameters:
+            kvCacheUtilThreshold: 0.92
+            queueDepthThreshold: 4
+        - type: token-load-scorer
+          parameters:
+            queueThresholdTokens: 67108864
+        - type: prefix-cache-scorer
+        - type: queue-scorer
+        - type: running-requests-size-scorer
+        - type: active-request-scorer
+        - type: kv-cache-utilization-scorer
+        - type: max-score-picker
+        schedulingProfiles:
+        - name: prefill
+          plugins:
+          - pluginRef: prefill-filter
+          - pluginRef: prefix-cache-affinity-filter
+          - pluginRef: token-load-scorer
+          - pluginRef: max-score-picker
+        - name: decode
+          plugins:
+          - pluginRef: decode-filter
+          - pluginRef: decode-spill
+          - pluginRef: prefix-cache-scorer
+            weight: 10
+          - pluginRef: queue-scorer
+            weight: 3
+          - pluginRef: running-requests-size-scorer
+            weight: 2
+          - pluginRef: active-request-scorer
+            weight: 2
+          - pluginRef: kv-cache-utilization-scorer
+            weight: 2
+          - pluginRef: max-score-picker
+
+  modelServers:
+    # Prefill serves vLLM on :8000; decode serves behind the routing sidecar on :8000.
+    targetPorts:
+      - number: 8000
+    matchLabels:
+      llm-d.ai/guide: "qwen3-5-397b"

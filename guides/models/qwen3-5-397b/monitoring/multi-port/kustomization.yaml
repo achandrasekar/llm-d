@@ -1,0 +1,60 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Multi-port PodMonitors for the `c600` (`dp4tp2`) operating point, where each decode pod
+# runs 4 local DP API servers on `modelserver` (:8200) and `rank1`..`rank3` (:8201..:8203).
+components:
+  - ../../../../recipes/modelserver/components/monitoring-pd
+
+labels:
+  - pairs:
+      llm-d.ai/inference-serving: "true"
+      llm-d.ai/guide: qwen3-5-397b
+      llm-d.ai/model: Qwen3.5-397B-A17B-FP8
+    includeSelectors: true
+    fields:
+      - group: monitoring.coreos.com
+        version: v1
+        kind: PodMonitor
+        path: metadata/labels
+        create: true
+      - group: monitoring.coreos.com
+        version: v1
+        kind: PodMonitor
+        path: spec/selector/matchLabels
+        create: true
+
+patches:
+  - target:
+      group: monitoring.coreos.com
+      version: v1
+      kind: PodMonitor
+      name: prefill
+    patch: |-
+      - op: replace
+        path: /spec/podMetricsEndpoints
+        value:
+          - port: modelserver
+            path: /metrics
+            interval: 5s
+  - target:
+      group: monitoring.coreos.com
+      version: v1
+      kind: PodMonitor
+      name: decode
+    patch: |-
+      - op: replace
+        path: /spec/podMetricsEndpoints
+        value:
+          - port: modelserver
+            path: /metrics
+            interval: 5s
+          - port: rank1
+            path: /metrics
+            interval: 5s
+          - port: rank2
+            path: /metrics
+            interval: 5s
+          - port: rank3
+            path: /metrics
+            interval: 5s

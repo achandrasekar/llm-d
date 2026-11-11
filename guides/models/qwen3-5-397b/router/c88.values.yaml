@@ -1,0 +1,93 @@
+## Qwen3.5-397B (Google TPU v7x, 1P5D TP8+DCP4 megakernel decode — c88 ultra-low latency)
+## guide overrides for the llm-d router.
+## Layer on top of: recipes/router/base.values.yaml
+
+router:
+  extraServicePorts:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: 8081
+
+  epp:
+    replicas: 1
+    flags:
+      allow-experimental-plugins: true
+    pluginsConfigFile: "pd-c88-config.yaml"
+    pluginsCustomConfig:
+      pd-c88-config.yaml: |
+        apiVersion: llm-d.ai/v1
+        kind: EndpointPickerConfig
+        plugins:
+        - type: disaggregatedset-rollout-screener
+          parameters:
+            scope:
+              labelSelector: "disaggregatedset.x-k8s.io/name=pd-disagg-tpu-qwen35"
+            revisionGating:
+              mode: max-role
+              requiredRoles: [prefill, decode]
+        - type: always-disagg-pd-decider
+        - type: disagg-profile-handler
+          parameters:
+            deciders:
+              prefill: always-disagg-pd-decider
+        - type: prefill-filter
+        - type: decode-filter
+        - type: approx-prefix-cache-producer
+          parameters:
+            autoTune: false
+            blockSizeTokens: 64
+            lruCapacityPerServer: 2000000
+            maxPrefixTokensToMatch: 262144
+        - type: inflight-load-producer
+        - type: prefix-cache-affinity-filter
+          parameters:
+            maxTTFTPenaltyMs: 8000
+            peakPrefillThroughput: 62000
+        - name: utilization-detector
+          type: utilization-detector
+          parameters:
+            kvCacheUtilThreshold: 0.98
+            queueDepthThreshold: 48
+        - name: decode-spill
+          type: utilization-detector
+          parameters:
+            kvCacheUtilThreshold: 0.92
+            queueDepthThreshold: 1
+        - type: token-load-scorer
+          parameters:
+            queueThresholdTokens: 67108864
+        - type: prefix-cache-scorer
+        - type: queue-scorer
+        - type: running-requests-size-scorer
+        - type: active-request-scorer
+        - type: kv-cache-utilization-scorer
+        - type: max-score-picker
+        schedulingProfiles:
+        - name: prefill
+          plugins:
+          - pluginRef: prefill-filter
+          - pluginRef: prefix-cache-affinity-filter
+          - pluginRef: token-load-scorer
+          - pluginRef: max-score-picker
+        - name: decode
+          plugins:
+          - pluginRef: decode-filter
+          - pluginRef: decode-spill
+          - pluginRef: prefix-cache-scorer
+            weight: 1
+          - pluginRef: queue-scorer
+            weight: 4
+          - pluginRef: running-requests-size-scorer
+            weight: 3
+          - pluginRef: active-request-scorer
+            weight: 3
+          - pluginRef: kv-cache-utilization-scorer
+            weight: 1
+          - pluginRef: max-score-picker
+
+  modelServers:
+    targetPorts:
+      - number: 8000
+    matchLabels:
+      llm-d.ai/guide: "qwen3-5-397b"

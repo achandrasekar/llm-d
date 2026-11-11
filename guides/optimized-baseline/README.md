@@ -349,7 +349,8 @@ Notes:
 * **Boot disk**: weights are downloaded once per node into `/var/cache/huggingface` (a `hostPath`), so the boot disk must hold the checkpoint above the kubelet ephemeral-storage eviction threshold or the pod is evicted mid-download and the node recycled. The 100 GB node-auto-provisioning default is too small for either model: use ≥ 200 GB for Qwen3-32B on v6e (66 GB) and ≥ 1 TB for Qwen3.5-397B-A17B-FP8 on TPU7x (406 GB; a 600 GB disk works but leaves only ~20 GiB of allocatable headroom).
 * **Cluster autoscaler**: under `OPTIMIZE_UTILIZATION` a one-pod TPU node is scaled down beneath the model server; annotate pods `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"`.
 * The Deployment uses `strategy: Recreate` because TPU node pools are fixed-size.
-* The TPU7x **vLLM** overlay runs the same engine layout as the [Qwen3.5-397B model guide](../models/qwen3-5-397b/README.md) (DP=8 × TP=1, EP, fp8 KV, 262k context) without KV offload or speculative decoding: it is the baseline the model guide and the tiered-prefix-cache guide add features to. The TPU7x **SGLang** overlay serves `Qwen/Qwen3-32B` (TP=8, 16k context); keep `MODEL=Qwen/Qwen3-32B` and skip `router/tpu-v7.values.yaml` when deploying with `MODEL_SERVER=sglang`.
+* The TPU7x **vLLM** overlay runs an aggregated single-host layout (`DP=8 × TP=1`, EP, fp8 KV, 262k context) without KV offload or speculative decoding: it is the single-pool baseline that the [tiered-prefix-cache](../tiered-prefix-cache/README.md) guide extends with host-DRAM/filesystem offloading and the [Qwen3.5-397B model guide](../models/qwen3-5-397b/README.md) scales out into a benchmarked xPyD `DisaggregatedSet`.
+  The TPU7x **SGLang** overlay serves `Qwen/Qwen3-32B` (TP=8, 16k context); keep `MODEL=Qwen/Qwen3-32B` and skip `router/tpu-v7.values.yaml` when deploying with `MODEL_SERVER=sglang`.
 
 </details>
 <!-- tabs:end -->

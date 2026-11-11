@@ -5,7 +5,7 @@
 ## sized for the TPU7x P/D engines: prefill runs --block-size=4352 with PCP=8 and a 262k
 ## context, so the router must hash prefixes on 4352-token blocks and track the full
 ## context, and the gate uses the throughput measured on this topology.
-## Mirrors guides/models/qwen3-5-397b/router/qwen3-5-397b-disagg.values.yaml.
+## For the xPyD AgentX Qwen3.5-397B router configurations, see guides/models/qwen3-5-397b/router/.
 
 router:
   epp:

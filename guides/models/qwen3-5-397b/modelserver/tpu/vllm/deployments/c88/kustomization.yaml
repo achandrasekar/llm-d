@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Ultra-low-latency operating point (`c88`): 1 prefill + 5 decode single-host tpu7x slices (24 chips),
+# TP8 + DCP4 megakernel decode (TP mode), `--max-num-seqs=1` per decode host.
+resources:
+  - ../../base
+
+components:
+  - ../../../../../../../recipes/modelserver/components/disaggregatedset-schema
+
+patches:
+  - path: patch.yaml

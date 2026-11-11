@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - serviceaccount.yaml
+  - sitecustomize-configmap.yaml
+  - disaggregatedset.yaml
+
+components:
+  - ../../../../../../recipes/modelserver/components/disaggregatedset-schema
+  - ../../../../../../recipes/modelserver/components/graceful-shutdown
+  - ../../../../../../recipes/modelserver/components/images/torch-tpu-vllm/nightly
+  - ../../../../../../recipes/modelserver/components/images/routing-sidecar/nightly
+
+# TODO(vllm-project/vllm-torchtpu): Remove override once all AgentX Qwen3.5 xPyD
+# optimizations (`infx-qwen35-agentx-disagg-candidate4` @ `5a1c82686`) land in an
+# upstream `vllm/vllm-torchtpu` release.
+images:
+  - name: docker.io/vllm/vllm-torchtpu
+    newName: us-central1-docker.pkg.dev/ironwood-496417/torchtpu-vllm/torchtpu-vllm-prod
+    newTag: ix-tpu-pd-cand4-llmd-oct28

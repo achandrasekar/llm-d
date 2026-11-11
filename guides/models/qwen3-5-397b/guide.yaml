@@ -12,8 +12,9 @@ support:
     tpu:
       label: Google TPU v7x
       notes: >-
-        GKE only · Torch TPU vLLM · `unified`: 2 replicas × 4 chips (`tpu7x` `2x2x1`, DP=8 × TP=1, EP, 262k context, host KV offload) ·
-        `TOPOLOGY=disaggregated`: a DisaggregatedSet with 1 prefill (PCP=8) + 1 decode (DP=8), TPU Sync P/D transfer and prefill host KV offload; scale to xPyD by raising the role replicas
+        GKE only · Torch TPU vLLM (SemiAnalysis AgentX recipe) · 6 to 8 single-host `tpu7x` `2x2x1` slices
+        (24 to 32 chips) by `DEPLOYMENT` (`c88`, `c208`, `c224`, `c368` default, `c600`) · xPyD `DisaggregatedSet`
+        with PP=8 prefill + 550 GB host-DRAM KV offload, Raiden P/D transfer, and TP8+DCP4 megakernel or DP4×TP2 decode
       model: Qwen/Qwen3.5-397B-A17B-FP8
       engines: {vllm: community}
 
@@ -31,12 +32,24 @@ env:
 
     ACCELERATOR_TYPE: {default: tpu, values: [tpu]}
     MODEL_SERVER: {default: vllm, values: [vllm]}
-    # unified: one serving pool with host KV offload (default); disaggregated: TPU Sync P/D DisaggregatedSet with prefill host KV offload
-    TOPOLOGY: {default: unified, values: [unified, disaggregated]}
+    # Pareto operating point on the SemiAnalysis AgentX curve (see Operating Points):
+    #   c88  = 1P5D (24 chips, TP8+DCP4 megakernel decode, ultra-low ITL)
+    #   c208 = 2P5D (28 chips, TP8+DCP4 megakernel decode, low ITL)
+    #   c224 = 2P4D (24 chips, TP8+DCP4 megakernel decode, balanced)
+    #   c368 = 3P5D (32 chips, TP8+DCP4 megakernel decode, high throughput, default)
+    #   c600 = 4P3D (28 chips, multi-port DP4xTP2 decode, maximum throughput)
+    DEPLOYMENT:
+      default: c368
+      values:
+        - c88
+        - c208
+        - c224
+        - c368
+        - c600
 
-    MODEL: {default: "Qwen/Qwen3.5-397B-A17B-FP8", comment: "the model both topologies serve"}
+    MODEL: {default: "Qwen/Qwen3.5-397B-A17B-FP8", comment: "the model every deployment serves"}
 
-  source: ["${REPO_ROOT}/guides/env.sh # defines GAIE_VERSION, ROUTER_CHART_VERSION, router chart URLs, and CURL_TEST_IMAGE"]
+  source: ["${REPO_ROOT}/guides/env.sh # defines GAIE_VERSION, LWS_VERSION, ROUTER_CHART_VERSION, router chart URLs, and CURL_TEST_IMAGE"]
 
 prerequisites:
   clone:
@@ -49,11 +62,10 @@ prerequisites:
     - run: |
         # GAIE_URL is automatically calculated from GAIE_VERSION at ${REPO_ROOT}/guides/env.sh
         kubectl apply -f https://github.com/kubernetes-sigs/gateway-api-inference-extension/${GAIE_URL}/v1-manifests.yaml
-  # The disaggregated topology runs prefill and decode as an LWS DisaggregatedSet.
+  # Every operating point runs prefill and decode as an LWS DisaggregatedSet.
   # skip_in ci: the nightly clusters already run LWS, and a second release would collide.
   lws:
-    - when: {TOPOLOGY: [disaggregated]}
-      skip_in: [ci]
+    - skip_in: [ci]
       run: |
         # helm upgrade never updates CRDs, so apply the chart's CRDs first (see LWS
         # "Upgrade by Helm"); this upgrades them on clusters that run an older LWS.
@@ -76,17 +88,9 @@ prerequisites:
 
 deploy:
   router_values:
-    unified:
-      - when: {TOPOLOGY: [unified]}
-        run: |
-          export ROUTER_BASE_VALUES="${REPO_ROOT}/guides/recipes/router/base.values.yaml"
-          export ROUTER_VALUES="${REPO_ROOT}/guides/models/${GUIDE_NAME}/router/${GUIDE_NAME}.values.yaml"
-    disaggregated:
-      - when: {TOPOLOGY: [disaggregated]}
-        skip_in: [ci]
-        run: |
-          export ROUTER_BASE_VALUES="${REPO_ROOT}/guides/recipes/router/base.values.yaml"
-          export ROUTER_VALUES="${REPO_ROOT}/guides/models/${GUIDE_NAME}/router/${GUIDE_NAME}-disagg.values.yaml"
+    - run: |
+        export ROUTER_BASE_VALUES="${REPO_ROOT}/guides/recipes/router/base.values.yaml"
+        export ROUTER_VALUES="${REPO_ROOT}/guides/models/${GUIDE_NAME}/router/${DEPLOYMENT}.values.yaml"
 
   monitoring_values:
     - when: {MONITORING: ["true"]}
@@ -102,22 +106,19 @@ deploy:
           -n ${NAMESPACE} --version ${ROUTER_CHART_VERSION}
 
   modelserver:
-    unified:
-      - when: {TOPOLOGY: [unified]}
-        run: |
-          kubectl apply -n ${NAMESPACE} \
-            -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/modelserver/${ACCELERATOR_TYPE}/${MODEL_SERVER}/
-    disaggregated:
-      - when: {TOPOLOGY: [disaggregated]}
-        skip_in: [ci]
-        run: |
-          kubectl apply -n ${NAMESPACE} \
-            -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/modelserver/${ACCELERATOR_TYPE}/${MODEL_SERVER}-disaggregated/
+    - run: |
+        kubectl apply -n ${NAMESPACE} \
+          -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/modelserver/${ACCELERATOR_TYPE}/${MODEL_SERVER}/deployments/${DEPLOYMENT}
 
   monitoring:
-    # PodMonitors for the prefill and decode model servers (unified pods are role=decode)
+    # PodMonitors for the prefill and decode model servers (c600 scrapes all 4 decode DP rank ports)
     - when: {MONITORING: ["true"]}
-      run: kubectl apply -n ${NAMESPACE} -k ${REPO_ROOT}/guides/recipes/modelserver/components/monitoring-pd
+      run: |
+        if [[ "${DEPLOYMENT}" == "c600" ]]; then
+          kubectl apply -n ${NAMESPACE} -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/monitoring/multi-port
+        else
+          kubectl apply -n ${NAMESPACE} -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/monitoring
+        fi
 
 verify:
   endpoint:
@@ -147,15 +148,11 @@ verify:
 
 cleanup:
   modelserver:
-    unified:
-      - when: {TOPOLOGY: [unified]}
-        run: kubectl delete -n ${NAMESPACE} -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/modelserver/${ACCELERATOR_TYPE}/${MODEL_SERVER}/
-    disaggregated:
-      - when: {TOPOLOGY: [disaggregated]}
-        skip_in: [ci]
-        run: kubectl delete -n ${NAMESPACE} -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/modelserver/${ACCELERATOR_TYPE}/${MODEL_SERVER}-disaggregated/
+    - run: kubectl delete -n ${NAMESPACE} -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/modelserver/${ACCELERATOR_TYPE}/${MODEL_SERVER}/deployments/${DEPLOYMENT}
   rest:
     - run: helm uninstall ${GUIDE_NAME} -n ${NAMESPACE}
-    - run: kubectl delete -n ${NAMESPACE} -k ${REPO_ROOT}/guides/recipes/modelserver/components/monitoring-pd --ignore-not-found=true
+    - run: |
+        kubectl delete -n ${NAMESPACE} -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/monitoring/multi-port --ignore-not-found=true
+        kubectl delete -n ${NAMESPACE} -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/monitoring --ignore-not-found=true
     - skip_in: [ci]
       run: kubectl delete namespace ${NAMESPACE}

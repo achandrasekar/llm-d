@@ -2,8 +2,8 @@
 ## Layer on top of: recipes/router/base.values.yaml and single-host/tiered-prefix-cache-cpu.values.yaml
 ##
 ## Same plugin chain as the default single-host values; only the producers are sized for
-## the TPU7x Qwen3.5-397B-A17B-FP8 engines (DP=8 x TP=1, fp8 KV, 262k context,
-## 32 GiB host tier per engine). Mirrors guides/models/qwen3-5-397b/router.
+## the TPU7x Qwen3.5-397B-A17B-FP8 single-host engines (DP=8 x TP=1, fp8 KV, 262k context,
+## 32 GiB host tier per engine).
 
 router:
   extraServicePorts:
