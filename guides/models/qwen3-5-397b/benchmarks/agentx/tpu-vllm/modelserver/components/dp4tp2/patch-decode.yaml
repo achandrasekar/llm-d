@@ -1,0 +1,168 @@
+# Decode role overrides for the `dp4tp2` (`c600`, 4P3D) operating point:
+#   - 3 decode replicas, each running attention DP=4 x TP=2 + EP=8 with fused-EP v3 dense slots.
+#   - `--data-parallel-multi-port-external-lb` exposes 4 local DP ranks on :8200..:8203 behind
+#     the routing sidecar on :8000..:8003, so the llm-d EPP routes directly to individual DP ranks.
+#   - 112 concurrent sequences per decode host (`--max-num-seqs=28` per DP rank).
+apiVersion: disaggregatedset.x-k8s.io/v1
+kind: DisaggregatedSet
+metadata:
+  name: pd-disagg-tpu-qwen35
+spec:
+  roles:
+    - name: decode
+      spec:
+        replicas: 3
+        leaderWorkerTemplate:
+          workerTemplate:
+            metadata:
+              annotations:
+                llm-d.ai/active-ports: "8000,8001,8002,8003"
+            spec:
+              initContainers:
+                - name: routing-proxy
+                  args:
+                    - --port=8000
+                    - --model-server-port=8200
+                    - --data-parallel-size=4
+                    - --kv-connector=nixlv2
+                    - --secure-serving=false
+                    - --zap-log-level=1
+                    - --prefill-max-retries=2
+                    - --prefill-retry-backoff=200ms
+                  ports:
+                    - name: sidecar
+                      containerPort: 8000
+                      protocol: TCP
+                    - name: sidecar-rank1
+                      containerPort: 8001
+                      protocol: TCP
+                    - name: sidecar-rank2
+                      containerPort: 8002
+                      protocol: TCP
+                    - name: sidecar-rank3
+                      containerPort: 8003
+                      protocol: TCP
+              containers:
+                - name: modelserver
+                  args:
+                    - |
+                      set -euo pipefail
+                      rm -f /tmp/libtpu_lockfile* /dev/shm/libtpu_lockfile* 2>/dev/null || true
+                      CACHE_ROOT="/var/lib/tpu-cache/qwen35-agentx-xpyd-cand4/dp4tp2/decode"
+                      mkdir -p "$CACHE_ROOT"
+                      export JAX_COMPILATION_CACHE_DIR="$CACHE_ROOT/jax_cache"
+                      export JAX_COMPILER_CACHE_DIR="$CACHE_ROOT/jax_cache"
+                      export TORCH_TPU_CACHE_DIR="$CACHE_ROOT/torch_tpu_cache"
+                      export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE="$CACHE_ROOT/torch_tpu_cache"
+                      export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT="$CACHE_ROOT/torch_tpu_tier3"
+                      export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="$CACHE_ROOT/torch_tpu_tier3"
+                      export VLLM_CACHE_ROOT="$CACHE_ROOT/vllm"
+                      export VLLM_XLA_CACHE_PATH="$CACHE_ROOT/xla_cache"
+                      if [[ "$POD_IP" == *":"* ]]; then
+                        HOST_ADDR="::"
+                        export VLLM_HOST_IP="[$POD_IP]"
+                      else
+                        HOST_ADDR="0.0.0.0"
+                        export VLLM_HOST_IP="$POD_IP"
+                      fi
+                      exec vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
+                        --served-model-name Qwen/Qwen3.5-397B-A17B-FP8 Qwen3.5-397B-A17B-FP8 \
+                        --default-chat-template-kwargs='{"enable_thinking":true}' \
+                        --tool-call-parser=qwen3_coder \
+                        --reasoning-parser=qwen3 \
+                        --api-server-count=1 \
+                        --trust-remote-code \
+                        --seed=42 \
+                        --max-model-len=262144 \
+                        --disable-custom-all-reduce \
+                        --gpu-memory-utilization=0.92 \
+                        --kv-cache-dtype=fp8 \
+                        --quantization=fp8 \
+                        --language-model-only \
+                        --limit-mm-per-prompt='{"image":0,"video":0}' \
+                        --no-disable-hybrid-kv-cache-manager \
+                        --attention-backend=CUSTOM \
+                        --mamba-cache-mode=align \
+                        --enable-prompt-tokens-details \
+                        --no-enable-log-requests \
+                        --disable-access-log-for-endpoints=/health,/metrics,/v1/models \
+                        --shutdown-timeout=45 \
+                        --enable-prefix-caching \
+                        --scheduler-cls=vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler \
+                        --disable-sliding-window \
+                        --host="$HOST_ADDR" \
+                        --port=8200 \
+                        --load-format=runai_streamer \
+                        --kv-cache-memory-bytes=39500000000 \
+                        --enable-expert-parallel \
+                        --async-scheduling \
+                        --max-num-batched-tokens=2048 \
+                        --max-num-seqs="$TPU_SCHED_MK_MAX_RUNNING" \
+                        --block-size=640 \
+                        --tensor-parallel-size=2 \
+                        --prefill-context-parallel-size=1 \
+                        --cp-kv-cache-interleave-size=1 \
+                        --data-parallel-size=4 \
+                        --data-parallel-size-local=4 \
+                        --data-parallel-multi-port-external-lb \
+                        --speculative-config="$DECODE_SPEC_CONFIG" \
+                        --compilation-config='{
+                          "backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor",
+                          "compile_sizes":[8,16,24,32,48,64,72,80,96,112,128,256,512,2048],
+                          "inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}
+                        }' \
+                        --kv-transfer-config='{
+                          "kv_connector":"TPURaidenConnector",
+                          "kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector",
+                          "kv_role":"kv_consumer",
+                          "kv_port":14579
+                        }'
+                  ports:
+                    - name: modelserver
+                      containerPort: 8200
+                      protocol: TCP
+                    - name: rank1
+                      containerPort: 8201
+                      protocol: TCP
+                    - name: rank2
+                      containerPort: 8202
+                      protocol: TCP
+                    - name: rank3
+                      containerPort: 8203
+                      protocol: TCP
+                  env:
+                    - name: TPU_EXPERT_PLACEMENT
+                      value: /workspace/vllm-torchtpu/expert_placement/expert_placement_dp8_ep8.json
+                    - {name: TPU_SCHED_MK_MAX_RUNNING, value: "28"}
+                    - {name: TPU_MULTIPORT_DP_LOCAL_SIZE, value: "4"}
+                    - {name: TPU_KV_BYTES_EXPLICIT, value: "1"}
+                    - {name: TPU_RAIDEN_DST_SHARDS, value: "2"}
+                    - {name: VLLM_TPU_QWEN35_MEGAKERNEL, value: "0"}
+                    - {name: VLLM_TPU_QWEN35_MTP_MK, value: "0"}
+                    - {name: VLLM_TPU_QWEN35_MK_FUSED_POOL_IO_MAX_B, value: "128"}
+                    - name: TPU_MOE_FUSED_EP_V3_CONFIG
+                      value: >-
+                        {"combine_real_tokens":true,"sort_index_compare":true,"compact_message":true,
+                        "reorder_chain":true,"dense_slots":true,"dense_slots_fused":true,
+                        "dense_slots_merged":true,"gdn_decode_tile_size":1,"dense_slots_skip_unrouted":true}
+                    - {name: TPU_DP_PACKED_ROUTER_GATHER, value: "1"}
+                    - {name: TPU_GDN_FUSED_1DOT, value: "1"}
+                    - {name: TPU_RPA_DECODE_LANES, value: "4"}
+                    - {name: TPU_RUNNER_STAGE_TIMING_MODE, value: "off"}
+                    - {name: TPU_MOE_FUSED_EP_STEP_MIN_TOKENS, value: "32"}
+                    - {name: TPU_SP_MIN_ROWS, value: "64"}
+                    - {name: TPU_TOKEN_BUCKET_EXTRA, value: "8,48,2048"}
+                    - {name: TPU_SCHED_DECODE_INFLIGHT_THROTTLE, $patch: delete}
+                    - {name: TPU_SCHED_PAW_PROMOTE_WARMEST, $patch: delete}
+                  # Ensure all 4 local DP rank servers (:8200..:8203) are serving before
+                  # Kubernetes marks the pod Ready in the InferencePool.
+                  readinessProbe:
+                    httpGet: null
+                    exec:
+                      command:
+                        - /bin/sh
+                        - -c
+                        - 'for p in 8200 8201 8202 8203; do curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:$p/v1/models" || exit 1; done'
+                    periodSeconds: 5
+                    timeoutSeconds: 10
+                    failureThreshold: 3

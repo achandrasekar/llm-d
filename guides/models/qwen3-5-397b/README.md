@@ -349,9 +349,21 @@ kubectl logs -n ${NAMESPACE} job/inference-perf -f
 
 ## Benchmark Results
 
-Results for `Qwen/Qwen3.5-397B-A17B-FP8` on Torch TPU are being collected with the workload above
-(`inference-perf` code-generation profile and the AgentX harness) for both topologies and will be
-published here with the model, slice, image digest and benchmark parameters of each run.
+### SemiAnalysis InferenceX AgentX (`xPyD` Disaggregated on TPU v7x)
+
+Published `llm-d` prefill/decode disaggregation results for `Qwen/Qwen3.5-397B-A17B-FP8` on Google Cloud TPU v7x (`tpu7x`, `2x2x1` 4-chip single-host slices) from the [**SemiAnalysis InferenceX Qwen-3.5 Dashboard**](https://inferencex.semianalysis.com/infx/inference/qwen-3-5) (`aiperf --scenario inferencex-agentx-mvp`, 262,144 max context, ~90K–100K mean input tokens/request, ~926–951 mean output tokens/request, 1-hour sustained multi-turn coding trace replay):
+
+- **Full reproducible submission recipe & optimization breakdown:** [**`benchmarks/agentx/tpu-vllm/README.md`**](benchmarks/agentx/tpu-vllm/README.md) (ships all five `c88`–`c600` `DisaggregatedSet` + `llm-d-router` operating points on the exact submission build, while this guide deploys the 2-node public-image configuration above).
+
+![Qwen3.5-397B-A17B-FP8 on TPU v7x with llm-d P/D Disaggregation — SemiAnalysis AgentX](benchmarks/agentx/tpu-vllm/results/agentx_pareto_tpuv7x.png)
+
+| Point | Layout (Chips) | Conc. | Total Tok/s | Total Tok/s/Chip | Output Tok/s | Output Tok/s/Chip | Median Interactivity (Tok/s/User) | Median / P90 ITL (ms) | Median / P90 TTFT (s) | Prefix Cache Hit (HBM + DRAM) | GSM8K (`em_strict`) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| [`c88`](benchmarks/agentx/tpu-vllm/modelserver/deployments/c88/kustomization.yaml) | `1P5D` (24) | 88 | 438,410 | 18,267 | 4,582 | 190.9 | **1,149.4** | **0.87** / 0.94 | 2.53 / 8.58 | 93.3% (87.0% + 6.3%) | 97.57% |
+| [`c208`](benchmarks/agentx/tpu-vllm/modelserver/deployments/c208/kustomization.yaml) | `2P5D` (28) | 208 | 999,669 | 35,702 | 9,407 | 335.9 | **671.1** | 1.49 / 1.60 | 5.04 / 11.95 | 92.9% (86.5% + 6.4%) | 97.27% |
+| [`c224`](benchmarks/agentx/tpu-vllm/modelserver/deployments/c224/kustomization.yaml) | `2P4D` (24) | 224 | 1,089,805 | 45,409 | 10,278 | 428.3 | **354.6** | 2.82 / 3.04 | 3.29 / 8.58 | 93.4% (85.9% + 7.5%) | 97.65% |
+| [**`c368`**](benchmarks/agentx/tpu-vllm/modelserver/deployments/c368/kustomization.yaml) | `3P5D` (32) | 368 | 1,722,770 | 53,837 | 16,544 | 517.0 | **233.6** | 4.28 / 4.56 | 2.57 / 6.63 | 92.6% (84.7% + 7.9%) | 97.57% |
+| [`c600`](benchmarks/agentx/tpu-vllm/modelserver/deployments/c600/kustomization.yaml) | `4P3D` (28) | 600 | **2,440,978** | **87,178** | **23,180** | **827.9** | 107.9 | 9.27 / 9.81 | **1.81** / **5.36** | 92.1% (80.9% + 11.2%) | **97.80%** |
 
 > [!NOTE]
 > The previous revision of this guide served `Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8` on the JAX

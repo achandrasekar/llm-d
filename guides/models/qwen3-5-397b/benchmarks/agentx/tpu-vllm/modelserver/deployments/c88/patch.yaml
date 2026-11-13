@@ -1,0 +1,42 @@
+apiVersion: disaggregatedset.x-k8s.io/v1
+kind: DisaggregatedSet
+metadata:
+  name: pd-disagg-tpu-qwen35
+spec:
+  roles:
+    - name: prefill
+      spec:
+        replicas: 1
+        leaderWorkerTemplate:
+          workerTemplate:
+            spec:
+              containers:
+                - name: modelserver
+                  env:
+                    - name: VLLM_TPU_FAST_FORWARD_CONTEXT
+                      value: "1"
+    - name: decode
+      spec:
+        replicas: 5
+        leaderWorkerTemplate:
+          workerTemplate:
+            spec:
+              containers:
+                - name: modelserver
+                  env:
+                    - name: TPU_SCHED_MK_MAX_RUNNING
+                      value: "1"
+                    - name: VLLM_TPU_QWEN35_MK_MODE
+                      value: tp
+                    - name: VLLM_TPU_QWEN35_MK_SH_AT
+                      value: "2"
+                    - name: VLLM_TPU_DECODE_CARRY
+                      value: "1"
+                    - name: VLLM_TPU_FAST_FORWARD_CONTEXT
+                      value: "1"
+                    - name: VLLM_TPU_T3_GC
+                      value: freeze
+                    - name: VLLM_TPU_T3_HOST
+                      value: "1"
+                    - name: VLLM_TPU_T3_SWITCH_US
+                      value: "200"

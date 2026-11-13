@@ -1,0 +1,791 @@
+# Qwen/Qwen3.5-397B-A17B-FP8 SemiAnalysis AgentX xPyD DisaggregatedSet on Google Cloud TPU v7x
+# (tpu7x, 2x2x1 single-host slices: 4 chips / 8 TensorCores per pod).
+#
+# Base configuration implements the common `tp8` profile (3P5D `c368` defaults):
+#   - Prefill: PP=8 x TP=1 (8,8,8,8,8,8,8,4 layer partition), 262k context, FP8 KV cache,
+#     2176-token blocks, MTP k=1, PrefixAwareScheduler, and TPUMultiConnector pairing Raiden
+#     P/D KV transfer (first, for load arbitration) with a 550 GB host-DRAM KV offload tier.
+#   - Decode (`tp8` profile): TP=8 + DCP=4 + EP=8 on the Qwen3.5 megakernel and MTP megakernel
+#     (k=3 with synthetic acceptance length 3.39, matching the AgentX benchmark runs), behind
+#     the llm-d routing sidecar.
+#
+# Per-operating-point overlays under ../deployments/{c88,c208,c224,c368,c600} apply the exact
+# point-specific replica counts, running caps, megakernel modes, or switch decode to DP=4 x TP=2.
+apiVersion: disaggregatedset.x-k8s.io/v1
+kind: DisaggregatedSet
+metadata:
+  name: pd-disagg-tpu-qwen35
+  labels:
+    llm-d.ai/inference-serving: "true"
+    llm-d.ai/guide: "qwen3-5-397b-agentx"
+    llm-d.ai/model: "Qwen3.5-397B-A17B-FP8"
+    llm-d.ai/accelerator-variant: "tpu"
+    llm-d.ai/accelerator-vendor: "google"
+    llm-d.ai/backend: "torch-tpu"
+    llm-d.ai/engine-type: "vllm"
+spec:
+  slices: 1
+  roles:
+    - name: prefill
+      spec:
+        replicas: 3
+        groupIdentity: Hash
+        rolloutStrategy:
+          rollingUpdateConfiguration:
+            maxSurge: 0
+            maxUnavailable: 1
+        leaderWorkerTemplate:
+          size: 1
+          workerTemplate:
+            metadata:
+              labels:
+                llm-d.ai/inference-serving: "true"
+                llm-d.ai/guide: "qwen3-5-397b-agentx"
+                llm-d.ai/model: "Qwen3.5-397B-A17B-FP8"
+                llm-d.ai/accelerator-variant: "tpu"
+                llm-d.ai/accelerator-vendor: "google"
+                llm-d.ai/backend: "torch-tpu"
+                llm-d.ai/engine-type: "vllm"
+                llm-d.ai/role: "prefill"
+              annotations:
+                cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+            spec:
+              serviceAccountName: pd-disagg-tpu-qwen35
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: "tpu7x"
+                cloud.google.com/gke-tpu-topology: "2x2x1"
+              tolerations:
+                - key: "google.com/tpu"
+                  operator: "Exists"
+                  effect: "NoSchedule"
+              initContainers:
+                - name: tpu-node-setup
+                  image: docker.io/library/busybox:1.37
+                  securityContext:
+                    privileged: true
+                  command: ["/bin/sh", "-c"]
+                  args:
+                    - |
+                      sysctl -w vm.max_map_count=8388608
+                      if [ -f /sys/module/vfio_iommu_type1/parameters/dma_entry_limit ]; then
+                        echo 2000000 > /sys/module/vfio_iommu_type1/parameters/dma_entry_limit
+                      fi
+              containers:
+                - name: modelserver
+                  image: REPLACE_MODEL_SERVER_IMAGE
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      set -euo pipefail
+                      rm -f /tmp/libtpu_lockfile* /dev/shm/libtpu_lockfile* 2>/dev/null || true
+                      CACHE_ROOT="/var/lib/tpu-cache/qwen35-agentx-xpyd-cand4/tp8/prefill"
+                      mkdir -p "$CACHE_ROOT"
+                      export JAX_COMPILATION_CACHE_DIR="$CACHE_ROOT/jax_cache"
+                      export JAX_COMPILER_CACHE_DIR="$CACHE_ROOT/jax_cache"
+                      export TORCH_TPU_CACHE_DIR="$CACHE_ROOT/torch_tpu_cache"
+                      export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE="$CACHE_ROOT/torch_tpu_cache"
+                      export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT="$CACHE_ROOT/torch_tpu_tier3"
+                      export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="$CACHE_ROOT/torch_tpu_tier3"
+                      export VLLM_CACHE_ROOT="$CACHE_ROOT/vllm"
+                      export VLLM_XLA_CACHE_PATH="$CACHE_ROOT/xla_cache"
+                      if [[ "$POD_IP" == *":"* ]]; then
+                        HOST_ADDR="::"
+                        export VLLM_HOST_IP="[$POD_IP]"
+                      else
+                        HOST_ADDR="0.0.0.0"
+                        export VLLM_HOST_IP="$POD_IP"
+                      fi
+                      exec vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
+                        --served-model-name Qwen/Qwen3.5-397B-A17B-FP8 Qwen3.5-397B-A17B-FP8 \
+                        --default-chat-template-kwargs='{"enable_thinking":true}' \
+                        --tool-call-parser=qwen3_coder \
+                        --reasoning-parser=qwen3 \
+                        --api-server-count=1 \
+                        --trust-remote-code \
+                        --seed=42 \
+                        --max-model-len=262144 \
+                        --disable-custom-all-reduce \
+                        --gpu-memory-utilization=0.92 \
+                        --kv-cache-dtype=fp8 \
+                        --quantization=fp8 \
+                        --language-model-only \
+                        --limit-mm-per-prompt='{"image":0,"video":0}' \
+                        --no-disable-hybrid-kv-cache-manager \
+                        --attention-backend=CUSTOM \
+                        --mamba-cache-mode=align \
+                        --enable-prompt-tokens-details \
+                        --no-enable-log-requests \
+                        --disable-access-log-for-endpoints=/health,/metrics,/v1/models \
+                        --shutdown-timeout=45 \
+                        --enable-prefix-caching \
+                        --scheduler-cls=vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler \
+                        --disable-sliding-window \
+                        --host="$HOST_ADDR" \
+                        --port=8000 \
+                        --max-num-batched-tokens=8192 \
+                        --long-prefill-token-threshold=262144 \
+                        --max-num-seqs=32 \
+                        --block-size=2176 \
+                        --tensor-parallel-size=1 \
+                        --pipeline-parallel-size=8 \
+                        --prefill-context-parallel-size=1 \
+                        --cp-kv-cache-interleave-size=1 \
+                        --data-parallel-size=1 \
+                        --data-parallel-size-local=1 \
+                        --speculative-config='{"method":"mtp","num_speculative_tokens":1}' \
+                        --compilation-config='{
+                          "backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor",
+                          "compile_sizes":[2176,4352,6528,8192],
+                          "inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}
+                        }' \
+                        --kv-transfer-config='{
+                          "kv_connector":"TPUMultiConnector",
+                          "kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector",
+                          "kv_role":"kv_producer",
+                          "kv_connector_extra_config":{"connectors":[
+                            {"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector",
+                             "kv_role":"kv_producer","kv_port":14579,"kv_connector_extra_config":{"destination_decode_context_parallel_size":4}},
+                            {"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"vllm_torchtpu.offload.raiden_connector",
+                             "kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":550000000000,"raiden_controller_port":47800}}
+                          ]}
+                        }'
+                  securityContext:
+                    capabilities:
+                      add:
+                        - IPC_LOCK
+                  ports:
+                    - name: modelserver
+                      containerPort: 8000
+                      protocol: TCP
+                    - name: tpu-kv-transfer
+                      containerPort: 9100
+                      protocol: TCP
+                    - name: tpu-pd-coord
+                      containerPort: 9600
+                      protocol: TCP
+                    - name: kv-rendezvous
+                      containerPort: 14579
+                      protocol: TCP
+                  env:
+                    - name: POD_IP
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: status.podIP
+                    - name: TPU_RAIDEN_ADVERTISE_HOST
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: status.podIP
+                    - name: TPU_RAIDEN_ENGINE_ID
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: metadata.name
+                    - name: HF_HOME
+                      value: /root/.cache/huggingface
+                    - name: HF_TOKEN
+                      valueFrom:
+                        secretKeyRef:
+                          name: llm-d-hf-token
+                          key: HF_TOKEN
+                          optional: true
+                    - {name: PYTHONPATH, value: /etc/llm-d-site}
+                    - {name: PYTHONUNBUFFERED, value: "1"}
+                    - {name: ENABLE_XPROF, value: "false"}
+                    - {name: HF_HUB_DISABLE_XET, value: "1"}
+                    - {name: PJRT_DEVICE, value: TPU}
+                    - {name: TPU_TOPOLOGY, value: 2x2x1}
+                    - {name: TPU_CHIPS_PER_HOST_BOUNDS, value: "2,2,1"}
+                    - {name: TPU_HOST_BOUNDS, value: "1,1,1"}
+                    - {name: MEGASCALE_COORDINATOR_ADDRESS, value: ""}
+                    - {name: MEGASCALE_NUM_SLICES, value: ""}
+                    - {name: MEGASCALE_PORT, value: ""}
+                    - {name: MEGASCALE_SLICE_ID, value: ""}
+                    - {name: TPU_LIBRARY_PATH, value: ""}
+                    - {name: TPU_PROCESS_ADDRESSES, value: ""}
+                    - {name: TPU_PROCESS_PORT, value: ""}
+                    - {name: TPU_WORKER_HOSTNAMES, value: ""}
+                    - {name: VLLM_TARGET_DEVICE, value: tpu}
+                    - {name: MODEL_IMPL_TYPE, value: vllm}
+                    - {name: TPU_BACKEND_TYPE, value: jax}
+                    - {name: JAX_PLATFORMS, value: "tpu,cpu"}
+                    - {name: SKIP_JAX_PRECOMPILE, value: "1"}
+                    - {name: JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS, value: "0"}
+                    - {name: XLA_PYTHON_CLIENT_PREALLOCATE, value: "false"}
+                    - {name: VLLM_XLA_CHECK_RECOMPILATION, value: "0"}
+                    - {name: TORCHINDUCTOR_AUTOGRAD_CACHE, value: "0"}
+                    - {name: TORCHINDUCTOR_MAX_WORKERS, value: "4"}
+                    - {name: TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_LOCAL_BACKUP_TASK, value: "0"}
+                    - name: LIBTPU_INIT_ARGS
+                      value: " --xla_tpu_use_minor_sharding_for_major_trivial_input=true\
+                        \ --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false\
+                        \ --xla_tpu_ars_combiner_threshold_in_bytes=0\
+                        \ --xla_tpu_enable_async_collective_merger=false\
+                        \ --xla_enable_async_all_gather=true\
+                        \ --xla_tpu_enable_sparse_core_collective_offload_all_gather=true\
+                        \ --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=262144"
+                    - {name: OMP_NUM_THREADS, value: "8"}
+                    - {name: TPU_EVICT_WEIGHTS_PAGE_CACHE, value: "1"}
+                    - {name: TPU_EXPERT_PLACEMENT, value: ""}
+                    - {name: TPU_TCMALLOC_RELEASE_FREE_MEMORY, value: "1"}
+                    - {name: RUNAI_STREAMER_MEMORY_LIMIT, value: "5368709120"}
+                    - {name: VLLM_ALLOW_LONG_MAX_MODEL_LEN, value: "1"}
+                    - {name: VLLM_ENGINE_READY_TIMEOUT_S, value: "10800"}
+                    - {name: VLLM_HTTP_TIMEOUT_KEEP_ALIVE, value: "300"}
+                    - {name: VLLM_LOGGING_LEVEL, value: INFO}
+                    - {name: VLLM_KV_CACHE_LAYOUT, value: HND}
+                    - {name: VLLM_MOE_CHUNK_SIZE, value: "256"}
+                    - {name: VLLM_PP_LAYER_PARTITION, value: "8,8,8,8,8,8,8,4"}
+                    - {name: VLLM_DP_MASTER_IP, value: "127.0.0.1"}
+                    - {name: SYNTHETIC_ACCEPTANCE_LENGTH, value: "3.39"}
+                    - {name: VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP, value: "1"}
+                    - {name: VLLM_TPU_LIGHTWEIGHT_STEP_STATS, value: "1"}
+                    - {name: VLLM_TPU_QWEN35_MEGAKERNEL, value: "0"}
+                    - {name: VLLM_TPU_QWEN35_MK_DCP_KV_HEADROOM, value: "0"}
+                    - {name: VLLM_TPU_QWEN35_MTP_MK, value: "0"}
+                    - {name: NEW_MODEL_DESIGN, value: "0"}
+                    - {name: TPU_QWEN35_AUTO_DEFAULTS, value: "1"}
+                    - {name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL, value: "1"}
+                    - {name: TPU_VLLM_SKIP_DYNAMIC_SMEM_NEGOTIATION_FLAG, value: "1"}
+                    - {name: TPU_KERNEL_PAGE_TOKENS, value: "128"}
+                    - {name: TPU_KV_CACHE_HEADROOM_MIB, value: "6144"}
+                    - {name: TPU_ROPE_CACHE_TRUNCATE, value: "1"}
+                    - {name: RAGGED_GATED_DELTA_RULE_IMPL, value: chunked_kernel_v3_pd}
+                    - {name: RAGGED_GATHER_REDUCE_VERSION, value: v3}
+                    - {name: TPU_ENABLE_GDN_DYNAMIC_TILING, value: "1"}
+                    - {name: TPU_GDN_CONV_QK_PAIR_LAYOUT, value: "1"}
+                    - {name: TPU_GDN_CONV_STATE_TILE_PAD, value: "1"}
+                    - {name: TPU_GDN_FUSED_NORM_QUANT, value: "1"}
+                    - {name: TPU_GDN_PREFILL_LAZY_CONV_STATE, value: "1"}
+                    - {name: TPU_GDN_PREFILL_SHARED_KKT, value: "1"}
+                    - {name: USE_BATCHED_RPA_KERNEL, value: "1"}
+                    - {name: USE_BATCHED_RPA_LONGCTX, value: "1"}
+                    - {name: TPU_RPA_FOLD_KV_HEAD_DIM, value: "0"}
+                    - {name: TPU_RPA_NATIVE_FP8_PREFILL, value: pvs}
+                    - {name: TPU_RPA_PREFILL_BLOCKS, value: "256,32,1024,1"}
+                    - {name: USE_FUSED_MOE_GMM, value: "1"}
+                    - {name: USE_MOE_COUNTING_SORT, value: "1"}
+                    - {name: USE_MOE_FUSED_EP_KERNEL, value: "0"}
+                    - {name: USE_MOE_FUSED_TP_AR, value: "0"}
+                    - {name: USE_MOE_SPARSE_CORE, value: "1"}
+                    - {name: MOE_FUSED_EP_KERNEL_MIN_TOKENS, value: "1024"}
+                    - {name: MOE_LOCAL_EXPERT_AFFINITY_EPSILON, value: "0.01"}
+                    - {name: ONEHOT_MOE_PERMUTE_THRESHOLD, value: "2048"}
+                    - {name: TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER, value: "1"}
+                    - {name: TPU_MOE_FUSED_EP_STEP_MIN_TOKENS, value: "33"}
+                    - {name: TPU_MOE_LOWTOK, value: "0"}
+                    - {name: TPU_MOE_LOWTOK_MAX_TOKENS, value: "256"}
+                    - {name: TPU_MOE_NONEP_PERMUTE, value: two_sorts}
+                    - {name: TPU_MOE_SEQUENCE_PARALLEL, value: "0"}
+                    - {name: TPU_MOE_SKIP_PADDED_TOKENS, value: "1"}
+                    - {name: TPU_SMALL_ALL_REDUCE, value: "0"}
+                    - {name: TPU_SP_FP8_GATHER, value: "1"}
+                    - {name: TPU_SP_MIN_ROWS, value: "512"}
+                    - {name: DP_SCHED_BATCH_PREFILL_MAX_ADMIT_PER_FLUSH, value: "0"}
+                    - {name: TPU_PP_CHUNK_SLACK, value: "0.5"}
+                    - {name: TPU_PP_EXTRA_STEPS_IN_FLIGHT, value: "1"}
+                    - {name: TPU_PP_INFLIGHT_COST, value: "0"}
+                    - {name: TPU_PREFILL_SKIP_VERIFY_WARMUP, value: "1"}
+                    - {name: TPU_SCHED_PAW_AGING_TOK_PER_S, value: "3000"}
+                    - {name: TPU_SCHED_PAW_MAX_WAIT_S, value: "10.0"}
+                    - {name: TPU_SCHED_PAW_PROMOTE_WARMEST, value: "0"}
+                    - {name: TPU_SCHED_PAW_SORT_WAITING, value: "1"}
+                    - {name: TPU_SCHED_PAW_SORT_WINDOW, value: "128"}
+                    - {name: QX_OFFLOAD_FENCE_AFTER_DRAFT, value: "1"}
+                    - {name: QX_TOKENIZE_PREFIX_CACHE, value: "1"}
+                    - {name: QX_TOKENIZE_PREFIX_CACHE_ENTRIES, value: "2048"}
+                    - {name: QX_TOKENIZE_PREFIX_CACHE_MAX_TOKENS, value: "64000000"}
+                    - {name: CONTROLLER_PORT, value: "27000"}
+                    - {name: RAIDEN_NUMA_POLICY, value: preferred}
+                    - {name: TPU_USE_RAIDEN_KV_CACHE_MANAGER, value: "1"}
+                    - {name: TPU_RAIDEN_CLIENT_IMPL, value: cpp}
+                    - {name: TPU_RAIDEN_ASYNC_COMPLETE, value: "1"}
+                    - {name: TPU_RAIDEN_DST_SHARDS, value: "8"}
+                    - {name: TPU_RAIDEN_JOB_NAME, value: prefill}
+                    - {name: TPU_KV_TRANSFER_NAMESPACE, value: prefill}
+                    - {name: TPU_KV_TRANSFER_PORT, value: "9100"}
+                    - {name: TPU_SIDE_CHANNEL_PORT, value: "9600"}
+                    - {name: TPU_KV_RESHARD_TRANSPORT, value: raiden}
+                    - {name: TPU_KV_RESHARD_DST_PAGE_TOKENS, value: "4096"}
+                    - {name: TPU_RAIDEN_RESHARD_IMPL, value: store}
+                    - {name: TPU_RAIDEN_RESHARD_PORT_BASE, value: "27000"}
+                    - {name: TPU_RAIDEN_STORE_DISPATCH_PORT_BASE, value: "27100"}
+                    - {name: TPU_RAIDEN_STAGE3_ASYNC_REGISTER, value: "1"}
+                    - {name: TPU_RAIDEN_TIER_DEMOTE_STATE, value: "1"}
+                    - {name: TPU_RAIDEN_TRANSFER_PARALLELISM, value: "8"}
+                    - {name: TPU_RAIDEN_POOL_TAGS_PER_LAYER, value: "1"}
+                    - {name: TPU_RAIDEN_PREFIX_AWARE_LOAD, value: "1"}
+                    - {name: TPU_RAIDEN_QWEN35_ADMISSION, value: "1"}
+                    - {name: TPU_RAIDEN_MAX_TRANSFER_TOKENS, value: "262144"}
+                    - {name: TPU_RAIDEN_MAX_CPU_BYTES, value: "550000000000"}
+                    - {name: TPU_RAIDEN_PP_MAX_CPU_BYTES, value: "720000000000"}
+                    - {name: TPU_OFFLOAD_MAX_ASYNC_LOAD_REQS, value: "16"}
+                    - {name: TPU_PREMAPPED_BUFFER_SIZE, value: "17179869184"}
+                    - {name: TPU_KV_SHM_POOL_GB, value: "8"}
+                    - {name: TPU_MAX_HOST_KV_BUFFER_SIZE, value: "64"}
+                    - {name: TPU_ENABLE_D2H_TRANSFER, value: "1"}
+                    - {name: TPU_HMA_D2H_COPY_IMPL, value: device_put}
+                    - {name: TPU_HMA_MAX_DONE_RECVING_BATCH, value: "1"}
+                    - {name: TPU_HMA_MIN_DONE_RECVING_BATCH, value: "1"}
+                    - {name: TPU_HMA_MAX_INFLIGHT_D2H_SENDS, value: "1"}
+                    - {name: TPU_HMA_MAX_INFLIGHT_PULLS, value: "8"}
+                    - {name: TPUMISC_HMA_CHECKSUM_TRACE, value: "0"}
+                    - {name: TPU_P2P_WAIT_PULL_TIMEOUT, value: "300"}
+                    - {name: TPU_PCP_REMAP_PROBE_TIMEOUT_S, value: "600"}
+                    - {name: TPU_DIST_CPU_TIMEOUT_S, value: "10800"}
+                    - {name: TPU_DRAFT_LOAD_BARRIER_TIMEOUT_S, value: "10800"}
+                  resources:
+                    requests:
+                      cpu: "200"
+                      memory: 850Gi
+                      google.com/tpu: "4"
+                    limits:
+                      cpu: "200"
+                      memory: 925Gi
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    - name: shm
+                      mountPath: /dev/shm
+                    - name: sitecustomize
+                      mountPath: /etc/llm-d-site
+                      readOnly: true
+                    - name: tpu-compile-cache
+                      mountPath: /var/lib/tpu-cache
+                    - name: huggingface-cache
+                      mountPath: /root/.cache/huggingface
+                  startupProbe:
+                    httpGet:
+                      path: /v1/models
+                      port: modelserver
+                    initialDelaySeconds: 30
+                    periodSeconds: 30
+                    timeoutSeconds: 5
+                    failureThreshold: 360
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: modelserver
+                    periodSeconds: 15
+                    timeoutSeconds: 5
+                    failureThreshold: 4
+                  readinessProbe:
+                    httpGet:
+                      path: /v1/models
+                      port: modelserver
+                    periodSeconds: 5
+                    timeoutSeconds: 5
+                    failureThreshold: 3
+              volumes:
+                - name: shm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 100Gi
+                - name: sitecustomize
+                  configMap:
+                    name: tpu-compile-sitecustomize
+                - name: tpu-compile-cache
+                  hostPath:
+                    path: /var/lib/tpu-cache
+                    type: DirectoryOrCreate
+                - name: huggingface-cache
+                  hostPath:
+                    path: /var/cache/huggingface
+                    type: DirectoryOrCreate
+
+    - name: decode
+      spec:
+        replicas: 5
+        groupIdentity: Hash
+        rolloutStrategy:
+          rollingUpdateConfiguration:
+            maxSurge: 0
+            maxUnavailable: 1
+        leaderWorkerTemplate:
+          size: 1
+          workerTemplate:
+            metadata:
+              labels:
+                llm-d.ai/inference-serving: "true"
+                llm-d.ai/guide: "qwen3-5-397b-agentx"
+                llm-d.ai/model: "Qwen3.5-397B-A17B-FP8"
+                llm-d.ai/accelerator-variant: "tpu"
+                llm-d.ai/accelerator-vendor: "google"
+                llm-d.ai/backend: "torch-tpu"
+                llm-d.ai/engine-type: "vllm"
+                llm-d.ai/role: "decode"
+              annotations:
+                cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+            spec:
+              serviceAccountName: pd-disagg-tpu-qwen35
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: "tpu7x"
+                cloud.google.com/gke-tpu-topology: "2x2x1"
+              tolerations:
+                - key: "google.com/tpu"
+                  operator: "Exists"
+                  effect: "NoSchedule"
+              initContainers:
+                - name: tpu-node-setup
+                  image: docker.io/library/busybox:1.37
+                  securityContext:
+                    privileged: true
+                  command: ["/bin/sh", "-c"]
+                  args:
+                    - |
+                      sysctl -w vm.max_map_count=8388608
+                      if [ -f /sys/module/vfio_iommu_type1/parameters/dma_entry_limit ]; then
+                        echo 2000000 > /sys/module/vfio_iommu_type1/parameters/dma_entry_limit
+                      fi
+                - name: routing-proxy
+                  image: REPLACE_ROUTING_SIDECAR_IMAGE
+                  imagePullPolicy: Always
+                  restartPolicy: Always
+                  args:
+                    - --port=8000
+                    - --model-server-port=8200
+                    - --kv-connector=nixlv2
+                    - --secure-serving=false
+                    - --zap-log-level=1
+                    - --prefill-max-retries=2
+                    - --prefill-retry-backoff=200ms
+                  ports:
+                    - name: sidecar
+                      containerPort: 8000
+                      protocol: TCP
+                  resources:
+                    requests:
+                      cpu: "1"
+                      memory: 1Gi
+                    limits:
+                      memory: 4Gi
+                  securityContext:
+                    allowPrivilegeEscalation: false
+                    runAsNonRoot: true
+              containers:
+                - name: modelserver
+                  image: REPLACE_MODEL_SERVER_IMAGE
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      set -euo pipefail
+                      rm -f /tmp/libtpu_lockfile* /dev/shm/libtpu_lockfile* 2>/dev/null || true
+                      CACHE_ROOT="/var/lib/tpu-cache/qwen35-agentx-xpyd-cand4/tp8/decode"
+                      mkdir -p "$CACHE_ROOT"
+                      export JAX_COMPILATION_CACHE_DIR="$CACHE_ROOT/jax_cache"
+                      export JAX_COMPILER_CACHE_DIR="$CACHE_ROOT/jax_cache"
+                      export TORCH_TPU_CACHE_DIR="$CACHE_ROOT/torch_tpu_cache"
+                      export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE="$CACHE_ROOT/torch_tpu_cache"
+                      export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT="$CACHE_ROOT/torch_tpu_tier3"
+                      export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="$CACHE_ROOT/torch_tpu_tier3"
+                      export VLLM_CACHE_ROOT="$CACHE_ROOT/vllm"
+                      export VLLM_XLA_CACHE_PATH="$CACHE_ROOT/xla_cache"
+                      if [[ "$POD_IP" == *":"* ]]; then
+                        HOST_ADDR="::"
+                        export VLLM_HOST_IP="[$POD_IP]"
+                      else
+                        HOST_ADDR="0.0.0.0"
+                        export VLLM_HOST_IP="$POD_IP"
+                      fi
+                      exec vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
+                        --served-model-name Qwen/Qwen3.5-397B-A17B-FP8 Qwen3.5-397B-A17B-FP8 \
+                        --default-chat-template-kwargs='{"enable_thinking":true}' \
+                        --tool-call-parser=qwen3_coder \
+                        --reasoning-parser=qwen3 \
+                        --api-server-count=1 \
+                        --trust-remote-code \
+                        --seed=42 \
+                        --max-model-len=262144 \
+                        --disable-custom-all-reduce \
+                        --gpu-memory-utilization=0.92 \
+                        --kv-cache-dtype=fp8 \
+                        --quantization=fp8 \
+                        --language-model-only \
+                        --limit-mm-per-prompt='{"image":0,"video":0}' \
+                        --no-disable-hybrid-kv-cache-manager \
+                        --attention-backend=CUSTOM \
+                        --mamba-cache-mode=align \
+                        --enable-prompt-tokens-details \
+                        --no-enable-log-requests \
+                        --disable-access-log-for-endpoints=/health,/metrics,/v1/models \
+                        --shutdown-timeout=45 \
+                        --enable-prefix-caching \
+                        --scheduler-cls=vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler \
+                        --disable-sliding-window \
+                        --host="$HOST_ADDR" \
+                        --port=8200 \
+                        --enable-expert-parallel \
+                        --async-scheduling \
+                        --max-num-batched-tokens=2048 \
+                        --max-num-seqs="$TPU_SCHED_MK_MAX_RUNNING" \
+                        --block-size=640 \
+                        --tensor-parallel-size=8 \
+                        --prefill-context-parallel-size=1 \
+                        --decode-context-parallel-size=4 \
+                        --cp-kv-cache-interleave-size=128 \
+                        --data-parallel-size=1 \
+                        --data-parallel-size-local=1 \
+                        --speculative-config="$DECODE_SPEC_CONFIG" \
+                        --compilation-config='{
+                          "backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor",
+                          "compile_sizes":[4,8,16,24,32,48,64,96,128,160,192,256,320,384,448,512,2048],
+                          "inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}
+                        }' \
+                        --kv-transfer-config='{
+                          "kv_connector":"TPURaidenConnector",
+                          "kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector",
+                          "kv_role":"kv_consumer",
+                          "kv_port":14579,
+                          "kv_connector_extra_config":{"destination_decode_context_parallel_size":4}
+                        }'
+                  securityContext:
+                    capabilities:
+                      add:
+                        - IPC_LOCK
+                  ports:
+                    - name: modelserver
+                      containerPort: 8200
+                      protocol: TCP
+                    - name: tpu-kv-transfer
+                      containerPort: 9100
+                      protocol: TCP
+                    - name: tpu-pd-coord
+                      containerPort: 9600
+                      protocol: TCP
+                    - name: kv-rendezvous
+                      containerPort: 14579
+                      protocol: TCP
+                  env:
+                    - name: POD_IP
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: status.podIP
+                    - name: TPU_RAIDEN_ADVERTISE_HOST
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: status.podIP
+                    - name: TPU_RAIDEN_ENGINE_ID
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: metadata.name
+                    - name: HF_HOME
+                      value: /root/.cache/huggingface
+                    - name: HF_TOKEN
+                      valueFrom:
+                        secretKeyRef:
+                          name: llm-d-hf-token
+                          key: HF_TOKEN
+                          optional: true
+                    - {name: PYTHONPATH, value: /etc/llm-d-site}
+                    - {name: PYTHONUNBUFFERED, value: "1"}
+                    - {name: ENABLE_XPROF, value: "false"}
+                    - {name: HF_HUB_DISABLE_XET, value: "1"}
+                    - {name: PJRT_DEVICE, value: TPU}
+                    - {name: TPU_TOPOLOGY, value: 2x2x1}
+                    - {name: TPU_CHIPS_PER_HOST_BOUNDS, value: "2,2,1"}
+                    - {name: TPU_HOST_BOUNDS, value: "1,1,1"}
+                    - {name: MEGASCALE_COORDINATOR_ADDRESS, value: ""}
+                    - {name: MEGASCALE_NUM_SLICES, value: ""}
+                    - {name: MEGASCALE_PORT, value: ""}
+                    - {name: MEGASCALE_SLICE_ID, value: ""}
+                    - {name: TPU_LIBRARY_PATH, value: ""}
+                    - {name: TPU_PROCESS_ADDRESSES, value: ""}
+                    - {name: TPU_PROCESS_PORT, value: ""}
+                    - {name: TPU_WORKER_HOSTNAMES, value: ""}
+                    - {name: VLLM_TARGET_DEVICE, value: tpu}
+                    - {name: MODEL_IMPL_TYPE, value: vllm}
+                    - {name: TPU_BACKEND_TYPE, value: jax}
+                    - {name: JAX_PLATFORMS, value: "tpu,cpu"}
+                    - {name: SKIP_JAX_PRECOMPILE, value: "1"}
+                    - {name: JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS, value: "0"}
+                    - {name: XLA_PYTHON_CLIENT_PREALLOCATE, value: "false"}
+                    - {name: VLLM_XLA_CHECK_RECOMPILATION, value: "0"}
+                    - {name: TORCHINDUCTOR_AUTOGRAD_CACHE, value: "0"}
+                    - {name: TORCHINDUCTOR_MAX_WORKERS, value: "4"}
+                    - {name: TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_LOCAL_BACKUP_TASK, value: "0"}
+                    - name: LIBTPU_INIT_ARGS
+                      value: " --xla_tpu_use_minor_sharding_for_major_trivial_input=true\
+                        \ --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false\
+                        \ --xla_tpu_ars_combiner_threshold_in_bytes=0\
+                        \ --xla_tpu_enable_async_collective_merger=false\
+                        \ --xla_enable_async_all_gather=true\
+                        \ --xla_tpu_enable_sparse_core_collective_offload_all_gather=true\
+                        \ --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=262144"
+                    - {name: OMP_NUM_THREADS, value: "8"}
+                    - {name: TPU_EVICT_WEIGHTS_PAGE_CACHE, value: "1"}
+                    - name: TPU_EXPERT_PLACEMENT
+                      value: /workspace/vllm-torchtpu/expert_placement/expert_placement_tp8_ep8_agentx_corr_c32.json
+                    - {name: TPU_TCMALLOC_RELEASE_FREE_MEMORY, value: "1"}
+                    - {name: RUNAI_STREAMER_MEMORY_LIMIT, value: "5368709120"}
+                    - {name: VLLM_ALLOW_LONG_MAX_MODEL_LEN, value: "1"}
+                    - {name: VLLM_ENGINE_READY_TIMEOUT_S, value: "10800"}
+                    - {name: VLLM_HTTP_TIMEOUT_KEEP_ALIVE, value: "300"}
+                    - {name: VLLM_LOGGING_LEVEL, value: INFO}
+                    - {name: VLLM_KV_CACHE_LAYOUT, value: HND}
+                    - {name: VLLM_MOE_CHUNK_SIZE, value: "256"}
+                    - {name: SYNTHETIC_ACCEPTANCE_LENGTH, value: "3.39"}
+                    - name: DECODE_SPEC_CONFIG
+                      value: '{"method":"mtp","num_speculative_tokens":3,"rejection_sample_method":"synthetic","synthetic_acceptance_length":3.39}'
+                    - {name: TPU_SCHED_MK_MAX_RUNNING, value: "16"}
+                    - {name: VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP, value: "1"}
+                    - {name: VLLM_TPU_QWEN35_MEGAKERNEL, value: "1"}
+                    - {name: VLLM_TPU_QWEN35_MK_BUCKETS, value: "0"}
+                    - {name: VLLM_TPU_QWEN35_MK_DCP_KV_HEADROOM, value: "0"}
+                    - {name: VLLM_TPU_QWEN35_MK_FUSED_POOL_IO_MAX_B, value: "160"}
+                    - {name: VLLM_TPU_QWEN35_MK_MODE, value: ep}
+                    - {name: VLLM_TPU_QWEN35_MK_SPLIT_WIDE, value: "1"}
+                    - {name: VLLM_TPU_QWEN35_MK_VERIFY_BUCKETS, value: "4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,96,104,112"}
+                    - {name: VLLM_TPU_QWEN35_MTP_MK, value: "1"}
+                    - {name: VLLM_TPU_QWEN35_MTP_MK_VERIFY_BUCKETS, value: "4,8,12,16,20,24,32,40,48,56,64"}
+                    - {name: ATTN_BUCKETIZED_NUM_REQS, value: "true"}
+                    - {name: ATTN_CUSTOM_NUM_REQS_BUCKETS, value: "8,16,32,64"}
+                    - {name: NEW_MODEL_DESIGN, value: "0"}
+                    - {name: TPU_QWEN35_AUTO_DEFAULTS, value: "1"}
+                    - {name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL, value: "1"}
+                    - {name: TPU_KERNEL_PAGE_TOKENS, value: "128"}
+                    - {name: TPU_KV_CACHE_HEADROOM_MIB, value: "6144"}
+                    - {name: TPU_ROPE_CACHE_TRUNCATE, value: "1"}
+                    - {name: RAGGED_GATED_DELTA_RULE_IMPL, value: chunked_kernel_v3_pd}
+                    - {name: RAGGED_GATHER_REDUCE_VERSION, value: v3}
+                    - {name: TPU_ENABLE_GDN_DYNAMIC_TILING, value: "1"}
+                    - {name: TPU_FUSED_SE_GATE_FRESH_BUFFER, value: "1"}
+                    - {name: TPU_FUSE_POST_ATTN_NORM, value: "1"}
+                    - {name: TPU_FUSE_PRE_ATTN_NORM, value: "1"}
+                    - {name: TPU_GDN_CONV_QK_PAIR_LAYOUT, value: "1"}
+                    - {name: TPU_GDN_CONV_STATE_TILE_PAD, value: "1"}
+                    - {name: TPU_GDN_FUSED_NORM_QUANT, value: "1"}
+                    - {name: TPU_GDN_KT_XPOSE, value: "1"}
+                    - {name: USE_BATCHED_RPA_KERNEL, value: "1"}
+                    - {name: USE_BATCHED_RPA_LONGCTX, value: "1"}
+                    - {name: TPU_RPA_DECODE_CAUSAL_MASK, value: "1"}
+                    - {name: TPU_RPA_DECODE_EXP2, value: "1"}
+                    - {name: TPU_RPA_DECODE_SKEW, value: "1"}
+                    - {name: TPU_RPA_DECODE_V2, value: "1"}
+                    - {name: TPU_RPA_FOLD_KV_HEAD_DIM, value: "0"}
+                    - {name: TPU_RPA_NATIVE_FP8, value: pvs}
+                    - {name: USE_FUSED_MOE_GMM, value: "1"}
+                    - {name: USE_MOE_COUNTING_SORT, value: "1"}
+                    - {name: USE_MOE_FUSED_EP_KERNEL, value: "1"}
+                    - {name: MOE_FUSED_EP_KERNEL_IMPL, value: v3}
+                    - {name: USE_MOE_FUSED_TP_AR, value: "0"}
+                    - {name: USE_MOE_SPARSE_CORE, value: "1"}
+                    - {name: MOE_FUSED_EP_KERNEL_MIN_TOKENS, value: "1024"}
+                    - {name: MOE_LOCAL_EXPERT_AFFINITY_EPSILON, value: "0.01"}
+                    - {name: ONEHOT_MOE_PERMUTE_THRESHOLD, value: "2048"}
+                    - {name: TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER, value: "1"}
+                    - {name: TPU_MOE_FUSED_EP_STEP_MIN_TOKENS, value: "33"}
+                    - {name: TPU_MOE_LOWTOK, value: "1"}
+                    - {name: TPU_MOE_LOWTOK_FUSED, value: "1"}
+                    - {name: TPU_MOE_LOWTOK_FUSED_COMBINE_FORM, value: hier}
+                    - {name: TPU_MOE_LOWTOK_FUSED_DISPATCH_FORM, value: hier}
+                    - {name: TPU_MOE_LOWTOK_FUSED_FP8_DISPATCH, value: "1"}
+                    - {name: TPU_MOE_LOWTOK_GATHER, value: "1"}
+                    - {name: TPU_MOE_LOWTOK_MAX_TOKENS, value: "448"}
+                    - {name: TPU_MOE_SEQUENCE_PARALLEL, value: "1"}
+                    - {name: TPU_MOE_SKIP_PADDED_TOKENS, value: "1"}
+                    - {name: TPU_SMALL_ALL_REDUCE, value: "1"}
+                    - {name: TPU_SMALL_ALL_REDUCE_TP, value: "1"}
+                    - {name: TPU_SMALL_ALL_REDUCE_TP_FORM, value: oneshot}
+                    - {name: TPU_SP_FP8_GATHER, value: "1"}
+                    - {name: TPU_SP_MIN_ROWS, value: "512"}
+                    - {name: TPU_SAMPLER_TOPK_CANDIDATES, value: "40"}
+                    - {name: TPU_SAMPLER_TOPK_MAX_K, value: "20"}
+                    - {name: TPU_SAMPLER_TOPK_PALLAS, value: "1"}
+                    - {name: TPU_TOKEN_BUCKET_EXTRA, value: "4,8,48,2048"}
+                    - {name: TPU_TOKEN_BUCKET_LINEAR_INTERVAL, value: "16"}
+                    - {name: TPU_TOKEN_BUCKET_LINEAR_UNTIL, value: "64"}
+                    - {name: DP_SCHED_BATCH_PREFILL_MAX_ADMIT_PER_FLUSH, value: "0"}
+                    - {name: TPU_PREFILL_SKIP_VERIFY_WARMUP, value: "1"}
+                    - {name: TPU_SCHED_DECODE_INFLIGHT_THROTTLE, value: "1"}
+                    - {name: TPU_SCHED_FINISH_DECODE_STEPS, value: "0"}
+                    - {name: TPU_SCHED_KV_PREFETCH_WAITING, value: "8"}
+                    - {name: TPU_SCHED_PAW_PROMOTE_WARMEST, value: "0"}
+                    - {name: TPU_SCHED_WARM_STREAK, value: "0"}
+                    - {name: CONTROLLER_PORT, value: "28000"}
+                    - {name: TPU_USE_RAIDEN_KV_CACHE_MANAGER, value: "1"}
+                    - {name: TPU_RAIDEN_CLIENT_IMPL, value: cpp}
+                    - {name: TPU_RAIDEN_ASYNC_COMPLETE, value: "1"}
+                    - {name: TPU_RAIDEN_DST_SHARDS, value: "8"}
+                    - {name: TPU_RAIDEN_JOB_NAME, value: decode}
+                    - {name: TPU_KV_TRANSFER_NAMESPACE, value: decode}
+                    - {name: TPU_KV_TRANSFER_PORT, value: "9100"}
+                    - {name: TPU_SIDE_CHANNEL_PORT, value: "9600"}
+                    - {name: TPU_KV_RESHARD_TRANSPORT, value: raiden}
+                    - {name: TPU_KV_RESHARD_DST_PAGE_TOKENS, value: "4096"}
+                    - {name: TPU_RAIDEN_RESHARD_IMPL, value: store}
+                    - {name: TPU_RAIDEN_RESHARD_PORT_BASE, value: "28000"}
+                    - {name: TPU_RAIDEN_STAGE3_LATE_POLL, value: "1"}
+                    - {name: TPU_RAIDEN_STORE_DISPATCH_PORT_BASE, value: "28100"}
+                    - {name: TPU_RAIDEN_TIER_DEMOTE_STATE, value: "1"}
+                    - {name: TPU_RAIDEN_TRANSFER_PARALLELISM, value: "8"}
+                    - {name: TPU_RAIDEN_POOL_TAGS_PER_LAYER, value: "1"}
+                    - {name: TPU_RAIDEN_PREFIX_AWARE_LOAD, value: "1"}
+                    - {name: TPU_RAIDEN_QWEN35_ADMISSION, value: "1"}
+                    - {name: TPU_RAIDEN_MAX_TRANSFER_TOKENS, value: "262144"}
+                    - {name: TPU_PREMAPPED_BUFFER_SIZE, value: "17179869184"}
+                    - {name: TPU_KV_SHM_POOL_GB, value: "8"}
+                    - {name: TPU_MAX_HOST_KV_BUFFER_SIZE, value: "64"}
+                    - {name: TPU_ENABLE_D2H_TRANSFER, value: "1"}
+                    - {name: TPU_HMA_D2H_COPY_IMPL, value: device_put}
+                    - {name: TPU_HMA_MAX_DONE_RECVING_BATCH, value: "1"}
+                    - {name: TPU_HMA_MIN_DONE_RECVING_BATCH, value: "1"}
+                    - {name: TPU_HMA_MAX_INFLIGHT_D2H_SENDS, value: "1"}
+                    - {name: TPU_HMA_MAX_INFLIGHT_PULLS, value: "8"}
+                    - {name: TPUMISC_HMA_CHECKSUM_TRACE, value: "0"}
+                    - {name: TPU_P2P_WAIT_PULL_TIMEOUT, value: "300"}
+                    - {name: TPU_DIST_CPU_TIMEOUT_S, value: "10800"}
+                    - {name: TPU_DRAFT_LOAD_BARRIER_TIMEOUT_S, value: "10800"}
+                  resources:
+                    requests:
+                      cpu: "200"
+                      memory: 850Gi
+                      google.com/tpu: "4"
+                    limits:
+                      cpu: "200"
+                      memory: 925Gi
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    - name: shm
+                      mountPath: /dev/shm
+                    - name: sitecustomize
+                      mountPath: /etc/llm-d-site
+                      readOnly: true
+                    - name: tpu-compile-cache
+                      mountPath: /var/lib/tpu-cache
+                    - name: huggingface-cache
+                      mountPath: /root/.cache/huggingface
+                  startupProbe:
+                    httpGet:
+                      path: /v1/models
+                      port: modelserver
+                    initialDelaySeconds: 30
+                    periodSeconds: 30
+                    timeoutSeconds: 5
+                    failureThreshold: 360
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: modelserver
+                    periodSeconds: 15
+                    timeoutSeconds: 5
+                    failureThreshold: 4
+                  readinessProbe:
+                    httpGet:
+                      path: /v1/models
+                      port: modelserver
+                    periodSeconds: 5
+                    timeoutSeconds: 5
+                    failureThreshold: 3
+              volumes:
+                - name: shm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 100Gi
+                - name: sitecustomize
+                  configMap:
+                    name: tpu-compile-sitecustomize
+                - name: tpu-compile-cache
+                  hostPath:
+                    path: /var/lib/tpu-cache
+                    type: DirectoryOrCreate
+                - name: huggingface-cache
+                  hostPath:
+                    path: /var/cache/huggingface
+                    type: DirectoryOrCreate

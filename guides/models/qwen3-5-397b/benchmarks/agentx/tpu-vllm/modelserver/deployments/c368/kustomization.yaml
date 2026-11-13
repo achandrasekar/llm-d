@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Default operating point (`c368`): 3 prefill + 5 decode single-host tpu7x slices (32 chips),
+# TP8 + DCP4 megakernel decode (EP mode), `--max-num-seqs=16` per decode host.
+resources:
+  - ../../base
+
+components:
+  - ../../../../../../../../recipes/modelserver/components/disaggregatedset-schema
+  # Uncomment to switch from AgentX synthetic MTP acceptance (3.39) to real rejection sampling:
+  # - ../../components/real-sampling
+
+patches:
+  - path: patch.yaml

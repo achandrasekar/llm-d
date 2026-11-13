@@ -1,0 +1,38 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Single-port PodMonitors for the TP8+DCP4 operating points (`c88`, `c208`, `c224`, `c368`),
+# scoped to this submission's pods (`llm-d.ai/guide: qwen3-5-397b-agentx`).
+components:
+  - ../../../../../../recipes/modelserver/components/monitoring-pd
+
+labels:
+  - pairs:
+      llm-d.ai/inference-serving: "true"
+      llm-d.ai/guide: qwen3-5-397b-agentx
+      llm-d.ai/model: Qwen3.5-397B-A17B-FP8
+    includeSelectors: true
+    fields:
+      - group: monitoring.coreos.com
+        version: v1
+        kind: PodMonitor
+        path: metadata/labels
+        create: true
+      - group: monitoring.coreos.com
+        version: v1
+        kind: PodMonitor
+        path: spec/selector/matchLabels
+        create: true
+
+patches:
+  - target:
+      group: monitoring.coreos.com
+      version: v1
+      kind: PodMonitor
+    patch: |-
+      - op: replace
+        path: /spec/podMetricsEndpoints
+        value:
+          - port: modelserver
+            path: /metrics
+            interval: 5s

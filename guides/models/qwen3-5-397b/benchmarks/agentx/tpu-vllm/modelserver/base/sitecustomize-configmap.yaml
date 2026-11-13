@@ -1,0 +1,172 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tpu-compile-sitecustomize
+data:
+  sitecustomize.py: |
+    # Loaded via PYTHONPATH=/etc/llm-d-site in every server and worker process:
+    #   1. Excludes pod-specific Raiden identity/address env vars from vllm_torchtpu's
+    #      compile-cache hash (`_TPU_COMPILE_ENV_IGNORED`) so replicas and restarts
+    #      share the persistent compile cache.
+    #   2. Makes vLLM `CompilerManager` cache index reads/writes atomic and best-effort.
+    import importlib.abc
+    import importlib.machinery
+    import importlib.util
+    import sys
+
+
+    def _ignore_advertise_host(module):
+        module._TPU_COMPILE_ENV_IGNORED.update({
+            "TPU_RAIDEN_ADVERTISE_HOST",
+            "TPU_RAIDEN_ENGINE_ID",
+        })
+
+
+    def _best_effort_index_save(module):
+        import builtins
+        import io
+        import logging
+        import os
+        import pprint
+        import socket
+
+        manager = getattr(module, "CompilerManager", None)
+        if manager is None or not hasattr(manager, "save_to_file"):
+            return
+        logger = logging.getLogger(module.__name__)
+        host = socket.gethostname()
+
+        orig_initialize_cache = getattr(manager, "initialize_cache", None)
+        if orig_initialize_cache is not None:
+            def initialize_cache(self, cache_dir, disable_cache=False, prefix=""):
+                prev_cache = dict(getattr(self, "cache", None) or {})
+                try:
+                    orig_initialize_cache(
+                        self, cache_dir, disable_cache=disable_cache, prefix=prefix
+                    )
+                except (OSError, SyntaxError, ValueError, TypeError) as e:
+                    logger.warning(
+                        "unable to read compiler manager cache %s: %s",
+                        getattr(self, "cache_file_path", cache_dir),
+                        e,
+                    )
+                    self.disable_cache = disable_cache
+                    self.cache_dir = cache_dir
+                    self.cache_file_path = os.path.join(
+                        cache_dir, "vllm_compile_cache.py"
+                    )
+                    self.cache = prev_cache
+                    self.compiler.initialize_cache(
+                        cache_dir=cache_dir,
+                        disable_cache=disable_cache,
+                        prefix=prefix,
+                    )
+                else:
+                    if prev_cache:
+                        self.cache.update(prev_cache)
+
+            manager.initialize_cache = initialize_cache
+
+        orig_load = getattr(manager, "load", None)
+        if orig_load is not None:
+            def load(self, graph, example_inputs, graph_index, compile_range):
+                try:
+                    return orig_load(
+                        self, graph, example_inputs, graph_index, compile_range
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "unable to load compiled graph for range %s (subgraph %s): %s",
+                        compile_range,
+                        graph_index,
+                        e,
+                    )
+                    return None
+
+            manager.load = load
+
+        def save_to_file(self):
+            if self.disable_cache or not self.is_cache_updated:
+                return
+            data = pprint.PrettyPrinter(indent=4).pformat(self.cache)
+            tmp_file = f"{self.cache_file_path}.{host}.{os.getpid()}.tmp"
+            try:
+                with open(tmp_file, "w") as f:
+                    f.write(data)
+                os.replace(tmp_file, self.cache_file_path)
+            except OSError as e:
+                logger.warning("unable to save compiler manager cache to %s: %s",
+                               self.cache_file_path, e)
+                try:
+                    os.remove(tmp_file)
+                except OSError:
+                    pass
+
+        manager.save_to_file = save_to_file
+
+        class _BestEffortFile(io.StringIO):
+            def __init__(self, path):
+                super().__init__()
+                self._path = path
+
+            def close(self):
+                if not self.closed:
+                    data = self.getvalue()
+                    tmp_file = f"{self._path}.{host}.{os.getpid()}.tmp"
+                    try:
+                        with builtins.open(tmp_file, "w") as f:
+                            f.write(data)
+                        os.replace(tmp_file, self._path)
+                    except OSError as e:
+                        logger.warning("unable to save %s: %s", self._path, e)
+                        try:
+                            os.remove(tmp_file)
+                        except OSError:
+                            pass
+                super().close()
+
+        def open_(file, mode="r", *args, **kwargs):
+            if mode == "w" and os.path.basename(str(file)) == "computation_graph.py":
+                return _BestEffortFile(file)
+            return builtins.open(file, mode, *args, **kwargs)
+
+        module.open = open_
+
+
+    _PATCHES = {
+        "vllm_torchtpu.compilation.tpu_compiler": _ignore_advertise_host,
+        "vllm.compilation.backends": _best_effort_index_save,
+    }
+
+
+    class _PatchFinder(importlib.abc.MetaPathFinder):
+        def find_spec(self, name, path, target=None):
+            patch = _PATCHES.pop(name, None)
+            if patch is None:
+                return None
+            if not _PATCHES:
+                sys.meta_path.remove(self)
+            spec = importlib.util.find_spec(name)
+            exec_module = spec.loader.exec_module
+
+            def patched_exec_module(module):
+                exec_module(module)
+                patch(module)
+
+            spec.loader.exec_module = patched_exec_module
+            return spec
+
+
+    sys.meta_path.insert(0, _PatchFinder())
+
+    _self = sys.modules.get(__name__)
+    sys.modules.pop(__name__, None)
+    _here = __file__
+    for _entry in sys.path:
+        _spec = importlib.machinery.PathFinder.find_spec(__name__, [_entry]) if _entry else None
+        if _spec and _spec.origin and _spec.origin != _here:
+            _module = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_module)
+            break
+    if _self is not None:
+        sys.modules[__name__] = _self

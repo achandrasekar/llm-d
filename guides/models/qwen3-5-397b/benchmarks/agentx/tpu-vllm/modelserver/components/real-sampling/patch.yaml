@@ -1,0 +1,28 @@
+apiVersion: disaggregatedset.x-k8s.io/v1
+kind: DisaggregatedSet
+metadata:
+  name: pd-disagg-tpu-qwen35
+spec:
+  roles:
+    - name: prefill
+      spec:
+        leaderWorkerTemplate:
+          workerTemplate:
+            spec:
+              containers:
+                - name: modelserver
+                  env:
+                    - name: SYNTHETIC_ACCEPTANCE_LENGTH
+                      value: "0"
+    - name: decode
+      spec:
+        leaderWorkerTemplate:
+          workerTemplate:
+            spec:
+              containers:
+                - name: modelserver
+                  env:
+                    - name: SYNTHETIC_ACCEPTANCE_LENGTH
+                      value: "0"
+                    - name: DECODE_SPEC_CONFIG
+                      value: '{"method":"mtp","num_speculative_tokens":3}'
