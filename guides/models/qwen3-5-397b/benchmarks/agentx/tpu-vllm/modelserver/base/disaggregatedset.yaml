@@ -78,7 +78,7 @@ spec:
                     - |
                       set -euo pipefail
                       rm -f /tmp/libtpu_lockfile* /dev/shm/libtpu_lockfile* 2>/dev/null || true
-                      CACHE_ROOT="/var/lib/tpu-cache/qwen35-agentx-xpyd-cand4/tp8/prefill"
+                      CACHE_ROOT="/.cache"
                       mkdir -p "$CACHE_ROOT"
                       export JAX_COMPILATION_CACHE_DIR="$CACHE_ROOT/jax_cache"
                       export JAX_COMPILER_CACHE_DIR="$CACHE_ROOT/jax_cache"
@@ -187,7 +187,6 @@ spec:
                           name: llm-d-hf-token
                           key: HF_TOKEN
                           optional: true
-                    - {name: PYTHONPATH, value: /etc/llm-d-site}
                     - {name: PYTHONUNBUFFERED, value: "1"}
                     - {name: ENABLE_XPROF, value: "false"}
                     - {name: HF_HUB_DISABLE_XET, value: "1"}
@@ -344,11 +343,8 @@ spec:
                   volumeMounts:
                     - name: shm
                       mountPath: /dev/shm
-                    - name: sitecustomize
-                      mountPath: /etc/llm-d-site
-                      readOnly: true
-                    - name: tpu-compile-cache
-                      mountPath: /var/lib/tpu-cache
+                    - name: torch-compile-cache
+                      mountPath: /.cache
                     - name: huggingface-cache
                       mountPath: /root/.cache/huggingface
                   startupProbe:
@@ -378,13 +374,8 @@ spec:
                   emptyDir:
                     medium: Memory
                     sizeLimit: 100Gi
-                - name: sitecustomize
-                  configMap:
-                    name: tpu-compile-sitecustomize
-                - name: tpu-compile-cache
-                  hostPath:
-                    path: /var/lib/tpu-cache
-                    type: DirectoryOrCreate
+                - name: torch-compile-cache
+                  emptyDir: {}
                 - name: huggingface-cache
                   hostPath:
                     path: /var/cache/huggingface
@@ -467,7 +458,7 @@ spec:
                     - |
                       set -euo pipefail
                       rm -f /tmp/libtpu_lockfile* /dev/shm/libtpu_lockfile* 2>/dev/null || true
-                      CACHE_ROOT="/var/lib/tpu-cache/qwen35-agentx-xpyd-cand4/tp8/decode"
+                      CACHE_ROOT="/.cache"
                       mkdir -p "$CACHE_ROOT"
                       export JAX_COMPILATION_CACHE_DIR="$CACHE_ROOT/jax_cache"
                       export JAX_COMPILER_CACHE_DIR="$CACHE_ROOT/jax_cache"
@@ -573,7 +564,6 @@ spec:
                           name: llm-d-hf-token
                           key: HF_TOKEN
                           optional: true
-                    - {name: PYTHONPATH, value: /etc/llm-d-site}
                     - {name: PYTHONUNBUFFERED, value: "1"}
                     - {name: ENABLE_XPROF, value: "false"}
                     - {name: HF_HUB_DISABLE_XET, value: "1"}
@@ -744,11 +734,8 @@ spec:
                   volumeMounts:
                     - name: shm
                       mountPath: /dev/shm
-                    - name: sitecustomize
-                      mountPath: /etc/llm-d-site
-                      readOnly: true
-                    - name: tpu-compile-cache
-                      mountPath: /var/lib/tpu-cache
+                    - name: torch-compile-cache
+                      mountPath: /.cache
                     - name: huggingface-cache
                       mountPath: /root/.cache/huggingface
                   startupProbe:
@@ -778,13 +765,8 @@ spec:
                   emptyDir:
                     medium: Memory
                     sizeLimit: 100Gi
-                - name: sitecustomize
-                  configMap:
-                    name: tpu-compile-sitecustomize
-                - name: tpu-compile-cache
-                  hostPath:
-                    path: /var/lib/tpu-cache
-                    type: DirectoryOrCreate
+                - name: torch-compile-cache
+                  emptyDir: {}
                 - name: huggingface-cache
                   hostPath:
                     path: /var/cache/huggingface

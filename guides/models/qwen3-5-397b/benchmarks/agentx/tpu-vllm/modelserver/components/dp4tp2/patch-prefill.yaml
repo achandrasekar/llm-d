@@ -24,7 +24,7 @@ spec:
                     - |
                       set -euo pipefail
                       rm -f /tmp/libtpu_lockfile* /dev/shm/libtpu_lockfile* 2>/dev/null || true
-                      CACHE_ROOT="/var/lib/tpu-cache/qwen35-agentx-xpyd-cand4/dp4tp2/prefill"
+                      CACHE_ROOT="/.cache"
                       mkdir -p "$CACHE_ROOT"
                       export JAX_COMPILATION_CACHE_DIR="$CACHE_ROOT/jax_cache"
                       export JAX_COMPILER_CACHE_DIR="$CACHE_ROOT/jax_cache"

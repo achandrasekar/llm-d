@@ -93,7 +93,7 @@ fi
 
 ### 3. Verify Readiness & Send a Test Request
 
-First-boot XLA compilation populates `/var/lib/tpu-cache` on each host (`startupProbe` allows up to 3 hours; subsequent restarts hit the persistent cache via `tpu-compile-sitecustomize`):
+First-boot XLA compilation populates the pod-local `emptyDir` cache (`/.cache`) on each host (`startupProbe` allows up to 3 hours):
 
 ```bash
 kubectl get pods -l llm-d.ai/guide=qwen3-5-397b-agentx -n "${NAMESPACE}" -w
@@ -241,7 +241,7 @@ Every pod configures custom OpenXLA / `libtpu` initialization flags (`LIBTPU_INI
 | `USE_MOE_SPARSE_CORE=1` / `USE_MOE_COUNTING_SORT=1` | `1` / `1` | Accelerates MoE token counting sort and gather/scatter routing using SparseCore |
 | `TPU_EXPERT_PLACEMENT` (decode) | `expert_placement_tp8_ep8_agentx_corr_c32.json` (`tp8`) / `expert_placement_dp8_ep8.json` (`dp4tp2`) | Places co-activated Qwen3.5 experts across chips using trace-calibrated correlation tables to balance ICI load |
 | `tpu-node-setup` `initContainer` | `vm.max_map_count=8388608`, `dma_entry_limit=2000000` | Raises host VM map and VFIO IOMMU DMA pin limits required by the 550 GB pinned Raiden DRAM pool |
-| [`tpu-compile-sitecustomize`](modelserver/base/sitecustomize-configmap.yaml) (`PYTHONPATH=/etc/llm-d-site`) | `sitecustomize.py` | Excludes per-pod `TPU_RAIDEN_ADVERTISE_HOST` and `TPU_RAIDEN_ENGINE_ID` from `_TPU_COMPILE_ENV_IGNORED` so `/var/lib/tpu-cache` hits across restarts and scale-outs |
+| `torch-compile-cache` (`emptyDir` at `/.cache`) | `JAX_COMPILATION_CACHE_DIR`, `TORCH_TPU_CACHE_DIR`, `VLLM_CACHE_ROOT` | Shares compiled JAX/TorchTPU/vLLM artifacts across local worker processes inside each pod |
 
 ---
 

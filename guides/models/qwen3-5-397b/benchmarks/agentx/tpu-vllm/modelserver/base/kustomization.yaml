@@ -3,7 +3,6 @@ kind: Kustomization
 
 resources:
   - serviceaccount.yaml
-  - sitecustomize-configmap.yaml
   - disaggregatedset.yaml
 
 components:
