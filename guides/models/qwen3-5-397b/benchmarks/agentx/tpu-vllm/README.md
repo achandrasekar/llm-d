@@ -133,21 +133,35 @@ kubectl apply -n "${NAMESPACE}" -k "${RECIPE_DIR}/modelserver/deployments/${POIN
 Run [`aiperf`](https://github.com/ai-dynamo/aiperf) inside the cluster against `${RELEASE_NAME}-epp` with the concurrency matching `POINT` (`88`, `208`, `224`, `368`, or `600`):
 
 ```bash
+export AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES=0
+export AIPERF_DATASET_CONFIGURATION_TIMEOUT=1800
+export AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT=1800
 export AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID=true
 export AIPERF_USE_DYNAMO_CONV_AWARE_ROUTING=0
 
 aiperf profile \
   --scenario 'inferencex-agentx-mvp' \
-  --url "http://${RELEASE_NAME}-epp.${NAMESPACE}.svc.cluster.local:80/v1" \
-  --model 'Qwen/Qwen3.5-397B-A17B-FP8' \
+  --url "http://${RELEASE_NAME}-epp.${NAMESPACE}.svc.cluster.local:80" \
+  --endpoint '/v1/chat/completions' \
   --endpoint-type 'chat' \
   --streaming \
-  --use-server-token-count \
-  --public-dataset 'semianalysis_cc_traces_weka_with_subagents' \
+  --model 'Qwen/Qwen3.5-397B-A17B-FP8' \
+  --tokenizer 'Qwen/Qwen3.5-397B-A17B-FP8' \
+  --tokenizer-trust-remote-code \
+  --public-dataset 'semianalysis_cc_traces_weka_062126_256k' \
+  --num-dataset-entries 393 \
+  --max-context-length 262144 \
   --concurrency "${POINT#c}" \
   --random-seed 42 \
+  --trajectory-start-min-ratio 0.25 \
+  --trajectory-start-max-ratio 0.75 \
+  --warmup-requests-per-lane 10 \
+  --trace-idle-gap-cap-seconds 300 \
+  --warmup-grace-period 1800 \
   --benchmark-duration 3600 \
+  --use-server-token-count \
   --no-gpu-telemetry \
+  --slice-duration 1.0 \
   --output-artifact-dir "./agentx-results-${POINT}" \
   --ui 'simple'
 ```
